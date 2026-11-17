@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-17
+
+First release.
+
 ### Added
 
 - XXL-JOB executor supporting admin 2.3.0 – 3.4.x (`AdminVersion` "2") and 3.5.0+ (`AdminVersion` "3.5").
@@ -21,4 +25,5 @@ All notable changes to this project are documented here. The format follows
   returns a line that is still being written.
 - Unit, stress, fuzz and end-to-end tests (admin 2.4.1, 3.4.2, 3.5.0), and benchmarks.
 
-[Unreleased]: https://github.com/ShawineWu/go-xxljob/commits/main
+[Unreleased]: https://github.com/ShawineWu/go-xxljob/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/ShawineWu/go-xxljob/releases/tag/v0.1.0
