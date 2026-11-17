@@ -3,7 +3,7 @@ module github.com/ShawineWu/go-xxljob/otelxxljob
 go 1.24.0
 
 require (
-	github.com/ShawineWu/go-xxljob v0.0.0-00010101000000-000000000000
+	github.com/ShawineWu/go-xxljob v0.1.0
 	github.com/stretchr/testify v1.12.1
 	go.opentelemetry.io/otel v1.41.0
 	go.opentelemetry.io/otel/metric v1.41.0
