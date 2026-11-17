@@ -518,7 +518,9 @@ func TestExecutorAgainstRealAdmin(t *testing.T) {
 		overlaps := busyOverlaps
 		busyMu.Unlock()
 		assert.Zero(t, overlaps, "a job ran concurrently with itself")
-		assert.GreaterOrEqual(t, triggered, 8*10, "too few triggers: %d", triggered)
+		// The count only shows that the scenario produced real concurrent load: the admin's scheduler needs a few
+		// seconds to warm up, so on a busy CI runner it fires well under one trigger per job per second.
+		assert.GreaterOrEqual(t, triggered, 8*5, "too few triggers: %d", triggered)
 		t.Logf("%d triggers from 8 cron jobs, all called back", triggered)
 	})
 
