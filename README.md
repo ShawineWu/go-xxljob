@@ -34,7 +34,6 @@ XXL-JOB is a widely used distributed task scheduler: the **admin** (scheduling c
 - [Advanced usage](#advanced-usage)
 - [How it works](#how-it-works)
 - [Testing](#testing)
-- [Migrating from xxl-job-executor-go](#migrating-from-xxl-job-executor-go)
 - [Contributing](#contributing) · [License](#license)
 
 ## Install
@@ -413,28 +412,6 @@ make bench      # benchmarks
 
 CI runs lint, unit tests on Go 1.24 – 1.26, a short fuzzing pass, `govulncheck`, CodeQL, and the end-to-end tests
 on all three admin versions.
-
-## Migrating from xxl-job-executor-go
-
-| xxl-job-executor-go | go-xxljob |
-|---|---|
-| `xxl.NewExecutor(...)`, `exec.Init()`, `go exec.Run()` | `xxljob.New(cfg)`, `exec.Start()`, `exec.Shutdown(ctx)` |
-| `exec.RegTask(name, func(ctx, *xxl.RunReq) string)` | `exec.MustRegister(name, handler)` or `exec.MustRegisterTasks(tasks...)` |
-| Return a message string (reported as **success** even on errors) | Return an `error`; use `xxljob.SetResult` for a success note |
-| `param.ExecutorParams` | `req.Params` or `req.BindJSON(&p)` |
-| `param.BroadcastIndex` / `BroadcastTotal` | `req.ShardIndex` / `req.ShardTotal` |
-| `exec.LogHandler(...)` | Not needed; execution logs are built in |
-
-Why a new library rather than patching the old one? These issues can't be worked around by callers:
-
-| Issue in xxl-job-executor-go (v1.2.0) | Consequence |
-|---|---|
-| Returned strings are always reported as success; only panics fail | Failed jobs show as successful, so alarms and retries never fire |
-| The executor port does not check the access token | Anything that can reach the port can trigger or kill any job |
-| All triggers of a JobHandler share one state | Kills hit the wrong run; results are attributed to the wrong trigger |
-| A killed job is removed from the running set immediately | The next trigger starts while the killed one is still running |
-| Signals are intercepted, the heartbeat can't be stopped, HTTP calls have no timeouts | No graceful shutdown; a stuck admin blocks the executor |
-| A busy port fails silently; failed callbacks are not retried | Triggers never arrive without any error; network blips lose results |
 
 ## Contributing
 

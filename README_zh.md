@@ -30,7 +30,6 @@ XXL-JOB 是广泛使用的分布式任务调度平台：**调度中心**决定�
 - [进阶用法](#进阶用法)
 - [设计](#设计)
 - [测试](#测试)
-- [从 xxl-job-executor-go 迁移](#从-xxl-job-executor-go-迁移)
 - [参与贡献](#参与贡献) · [许可证](#许可证)
 
 ## 安装
@@ -381,28 +380,6 @@ make bench      # 基准测试
   需要 Docker（compose v2）。调度中心的建表 SQL 在测试时下载并校验 SHA-256（XXL-JOB 以 GPL 发布，不放进本仓库）。
 
 CI 会运行 lint、Go 1.24 ~ 1.26 的单元测试、简短的模糊测试、`govulncheck`、CodeQL，以及三个调度中心版本的端到端测试。
-
-## 从 xxl-job-executor-go 迁移
-
-| xxl-job-executor-go | go-xxljob |
-|---|---|
-| `xxl.NewExecutor(...)`、`exec.Init()`、`go exec.Run()` | `xxljob.New(cfg)`、`exec.Start()`、`exec.Shutdown(ctx)` |
-| `exec.RegTask(name, func(ctx, *xxl.RunReq) string)` | `exec.MustRegister(name, handler)` 或 `exec.MustRegisterTasks(tasks...)` |
-| 返回字符串（出错也**按成功回报**） | 返回 `error`；成功备注用 `xxljob.SetResult` |
-| `param.ExecutorParams` | `req.Params` 或 `req.BindJSON(&p)` |
-| `param.BroadcastIndex` / `BroadcastTotal` | `req.ShardIndex` / `req.ShardTotal` |
-| `exec.LogHandler(...)` | 不需要，内置执行日志 |
-
-为什么新写一个库，而不是修补原来的？因为下面这些问题调用方没法绕过：
-
-| xxl-job-executor-go（v1.2.0）的问题 | 后果 |
-|---|---|
-| 任务返回的字符串一律按成功回报，只有 panic 才算失败 | 任务失败时调度中心仍显示成功，告警和失败重试都不会触发 |
-| 执行器端口不校验 token | 任何能访问端口的程序都能触发或终止任意任务 |
-| 同一个 JobHandler 的所有调度共用一份状态 | 终止错了调度；结果记到别的调度上 |
-| 终止后立刻把任务移出运行列表 | 被终止的还没退出，下一次调度就开始了 |
-| 拦截退出信号、心跳停不下来、HTTP 请求没有超时 | 无法优雅退出；调度中心卡住时执行器跟着阻塞 |
-| 端口被占时静默失败；回调失败不重试 | 收不到调度也不报错；网络抖动就丢结果 |
 
 ## 参与贡献
 
