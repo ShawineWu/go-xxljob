@@ -131,15 +131,20 @@ func (e *Executor) dispatch(in runReq) reply {
 			case len(t.queue) >= e.cfg.MaxQueueSize:
 				return failure(fmt.Sprintf("job queue is full (%d triggers waiting)", len(t.queue)))
 			}
-		} else {
-			t = &jobThread{jobID: in.JobID, handler: req.Handler}
-			e.threads[in.JobID] = t
-			e.wg.Add(1)
-			go e.runThread(t)
 		}
 		mws := append(append([]Middleware(nil), e.middlewares...), reg.mws...)
 		ctx, cancel := context.WithCancelCause(e.root)
-		t.queue = append(t.queue, &trigger{req: req, logDateTime: in.LogDateTime, handler: chain(reg.h, mws...), ctx: ctx, cancel: cancel})
+		tr := &trigger{req: req, logDateTime: in.LogDateTime, handler: chain(reg.h, mws...), ctx: ctx, cancel: cancel}
+		if t != nil {
+			t.queue = append(t.queue, tr)
+			return success("")
+		}
+		// An idle job gets a new thread that starts with this trigger as its running one, so the trigger is never
+		// seen as queued: Shutdown waits for it like any other run instead of discarding it.
+		t = &jobThread{jobID: in.JobID, handler: req.Handler, running: tr}
+		e.threads[in.JobID] = t
+		e.wg.Add(1)
+		go e.runThread(t)
 		return success("")
 	}()
 	for _, tr := range dropped {
@@ -170,33 +175,31 @@ func (e *Executor) kill(jobID int64) reply {
 	return success("")
 }
 
-// runThread is the job thread: it runs queued triggers one by one and exits when the queue is empty.
+// runThread is the job thread: it runs the trigger it was created with, then the queued ones one by one, and exits
+// when the queue is empty. The next trigger becomes the running one under the same lock that clears the previous
+// one, so the job never looks idle between two runs.
 func (e *Executor) runThread(t *jobThread) {
 	defer e.wg.Done()
-	var done *result
-	for {
+	e.mu.Lock()
+	next := t.running
+	e.mu.Unlock()
+	for next != nil {
+		res := e.execute(next)
+		next.cancel(nil)
+
 		e.mu.Lock()
-		t.running = nil
-		var next *trigger
+		next = nil
 		if len(t.queue) > 0 {
 			next = t.queue[0]
 			t.queue[0] = nil
 			t.queue = t.queue[1:]
-			t.running = next
 		} else if e.threads[t.jobID] == t {
 			delete(e.threads, t.jobID)
 		}
+		t.running = next
 		e.mu.Unlock()
 
-		if done != nil {
-			e.cb.push(*done)
-		}
-		if next == nil {
-			return
-		}
-		p := e.execute(next)
-		next.cancel(nil)
-		done = &p
+		e.cb.push(res)
 	}
 }
 

@@ -410,7 +410,7 @@ make bench      # benchmarks
   compose v2. The admin's schema SQL is downloaded at test time and checked against a SHA-256 (XXL-JOB is GPL
   licensed, so it is not vendored here).
 
-CI runs lint, unit tests on Go 1.24 – 1.26, a short fuzzing pass, `govulncheck`, CodeQL, and the end-to-end tests
+CI runs lint, unit tests on Go 1.24 and the two latest Go releases, a short fuzzing pass, `govulncheck`, CodeQL, and the end-to-end tests
 on all three admin versions.
 
 ## Contributing

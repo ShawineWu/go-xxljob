@@ -379,7 +379,7 @@ make bench      # 基准测试
 - **端到端测试**针对每个支持的版本运行官方 `xuxueli/xxl-job-admin` 镜像，包括调度中心每秒按 Cron 触发、且执行时间与下一次调度重叠的任务。
   需要 Docker（compose v2）。调度中心的建表 SQL 在测试时下载并校验 SHA-256（XXL-JOB 以 GPL 发布，不放进本仓库）。
 
-CI 会运行 lint、Go 1.24 ~ 1.26 的单元测试、简短的模糊测试、`govulncheck`、CodeQL，以及三个调度中心版本的端到端测试。
+CI 会运行 lint、Go 1.24 及最新两个 Go 版本的单元测试、简短的模糊测试、`govulncheck`、CodeQL，以及三个调度中心版本的端到端测试。
 
 ## 参与贡献
 

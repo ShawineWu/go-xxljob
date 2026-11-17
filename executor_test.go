@@ -1092,6 +1092,28 @@ func TestAdminVersionConfig(t *testing.T) {
 // Edge cases
 // ---------------------------------------------------------------------------------------------
 
+func TestShutdownRightAfterTrigger(t *testing.T) {
+	// Scenario: the executor shuts down immediately after accepting a trigger for an idle job, before the job's
+	//           goroutine has had a chance to start it
+	// Given: an idle job; Shutdown is called as soon as the trigger is accepted, with a 2s deadline
+	// Expect: the trigger counts as running from the moment it is accepted (never as queued), so Shutdown waits for it
+	//         and it succeeds instead of being discarded
+	h := newHarness(t, map[string]Handler{"T": HandlerFunc(func(ctx context.Context, _ *Request) error {
+		time.Sleep(20 * time.Millisecond)
+		return ctx.Err()
+	})})
+
+	h.run(t, runReq{JobID: 1, LogID: 1, ExecutorHandler: "T"})
+	accepted := h.e.Stats()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := h.e.Shutdown(ctx)
+
+	require.NoError(t, err)
+	assert.Equal(t, Stats{Running: 1}, accepted)
+	assert.Equal(t, 200, h.admin.callback(t, 1).Code)
+}
+
 func TestLongResultMessageIsTruncated(t *testing.T) {
 	// Scenario: a job fails with an error message far longer than the admin can store
 	// Given: an error of 3000 multi-byte runes

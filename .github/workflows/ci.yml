@@ -19,7 +19,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: stable
+          # golangci-lint can only load code for Go versions up to the one it was built with; keep these in step.
+          go-version: "1.26"
       - uses: golangci/golangci-lint-action@v8
         with:
           version: v2.11
@@ -30,7 +31,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go: ["1.24", "1.25", "1.26"]
+        go: ["1.24", "oldstable", "stable"] # the minimum supported version and the two latest releases
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -41,7 +42,7 @@ jobs:
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1
       - name: Upload coverage
-        if: matrix.go == '1.26'
+        if: matrix.go == 'stable'
         uses: actions/upload-artifact@v4
         with:
           name: coverage
