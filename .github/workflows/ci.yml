@@ -16,12 +16,12 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
           # golangci-lint can only load code for Go versions up to the one it was built with; keep these in step.
           go-version: "1.26"
-      - uses: golangci/golangci-lint-action@v8
+      - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.11
 
@@ -33,8 +33,8 @@ jobs:
       matrix:
         go: ["1.24", "oldstable", "stable"] # the minimum supported version and the two latest releases
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go }}
       - name: Test
@@ -43,7 +43,7 @@ jobs:
         run: go tool cover -func=coverage.out | tail -1
       - name: Upload coverage
         if: matrix.go == 'stable'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: coverage.out
@@ -51,15 +51,15 @@ jobs:
   fuzz:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
           go-version: stable
       - name: Fuzz each target for 20s
         run: make fuzz FUZZTIME=20s
       - name: Upload failing inputs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-failures
           path: testdata/fuzz
@@ -67,8 +67,8 @@ jobs:
   vuln:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
           go-version: stable
       - name: govulncheck
@@ -84,12 +84,12 @@ jobs:
       matrix:
         version: ["2.4.1", "3.4.2", "3.5.0"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
           go-version: stable
       - name: Cache xxl-job schema
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: e2e/.cache
           key: xxl-job-schema-${{ matrix.version }}
