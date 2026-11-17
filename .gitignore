@@ -1,0 +1,14 @@
+# Build and test output
+*.test
+*.out
+coverage.*
+/bin/
+
+# e2e downloads (xxl-job schema SQL)
+e2e/.cache/
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

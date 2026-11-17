@@ -1,0 +1,43 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: A minimal program or test, plus the job settings in the admin (block strategy, timeout, routing).
+    validations:
+      required: true
+  - type: input
+    id: lib-version
+    attributes:
+      label: go-xxljob version
+      placeholder: v0.1.0 or commit
+    validations:
+      required: true
+  - type: input
+    id: admin-version
+    attributes:
+      label: xxl-job-admin version
+      placeholder: "2.4.1"
+    validations:
+      required: true
+  - type: input
+    id: go-version
+    attributes:
+      label: Go version
+      placeholder: go1.26.1 linux/amd64
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Executor logs and the execution log shown in the admin. Remove tokens and other secrets.
+      render: text
