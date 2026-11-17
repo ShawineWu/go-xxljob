@@ -1290,3 +1290,94 @@ func TestStatsCounters(t *testing.T) {
 	assert.True(t, st.Registered)
 	assert.False(t, after.Registered)
 }
+
+// runExecutor starts e.Run in the background, mounted on an httptest server, and returns the harness and a channel
+// that receives Run's result.
+func runExecutor(t *testing.T, admin *fakeAdmin, e *Executor, ctx context.Context) (*harness, <-chan error) {
+	t.Helper()
+	srv := httptest.NewServer(e.Handler())
+	t.Cleanup(srv.Close)
+	done := make(chan error, 1)
+	go func() { done <- e.Run(ctx) }()
+	require.Eventually(t, func() bool { return e.Stats().Registered }, 2*time.Second, 5*time.Millisecond)
+	return &harness{e: e, admin: admin, srv: srv}, done
+}
+
+func waitRun(t *testing.T, done <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return")
+		return nil
+	}
+}
+
+func TestRunStopsGracefully(t *testing.T) {
+	// Scenario: Run drives the executor from start to graceful stop
+	// Given: Run is started; a job that takes 100ms is triggered; the context is cancelled while it runs
+	// Expect: Run returns nil once the job has finished and its result was reported; the executor deregistered
+	admin := newFakeAdmin(t)
+	g := newGate()
+	e, err := New(testConfig(admin.srv.URL), WithoutServer(), WithLogger(quiet))
+	require.NoError(t, err)
+	require.NoError(t, e.Register("T", g))
+	ctx, cancel := context.WithCancel(context.Background())
+	h, done := runExecutor(t, admin, e, ctx)
+
+	h.run(t, runReq{JobID: 1, LogID: 1, ExecutorHandler: "T"})
+	g.waitStart(t)
+	cancel()
+	time.AfterFunc(100*time.Millisecond, func() { close(g.release) })
+	err = waitRun(t, done)
+
+	require.NoError(t, err)
+	assert.Equal(t, 200, admin.callback(t, 1).Code)
+	assert.Positive(t, admin.removed.Load())
+	assert.False(t, e.Stats().Registered)
+}
+
+func TestRunShutdownTimeout(t *testing.T) {
+	// Scenario: a job is still running when Run's shutdown timeout expires
+	// Given: ShutdownTimeout 50ms; the job only returns when its context is cancelled
+	// Expect: Run cancels it with ErrShutdown and returns context.DeadlineExceeded; the job is reported as failed
+	admin := newFakeAdmin(t)
+	cfg := testConfig(admin.srv.URL)
+	cfg.ShutdownTimeout = 50 * time.Millisecond
+	g := newGate()
+	e, err := New(cfg, WithoutServer(), WithLogger(quiet))
+	require.NoError(t, err)
+	require.NoError(t, e.Register("T", g))
+	ctx, cancel := context.WithCancel(context.Background())
+	h, done := runExecutor(t, admin, e, ctx)
+
+	h.run(t, runReq{JobID: 1, LogID: 1, ExecutorHandler: "T"})
+	g.waitStart(t)
+	cancel()
+	err = waitRun(t, done)
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	res := admin.callback(t, 1)
+	assert.Equal(t, 500, res.Code)
+	assert.Contains(t, res.Msg, ErrShutdown.Error())
+}
+
+func TestRunStartError(t *testing.T) {
+	// Scenario: Run cannot start because the executor port is taken
+	// Given: another listener holds the configured port
+	// Expect: Run returns the listen error immediately, without waiting for its context
+	busy, err := net.Listen("tcp", ":0") // all interfaces, like the executor
+	require.NoError(t, err)
+	defer func() { _ = busy.Close() }()
+	cfg := testConfig(newFakeAdmin(t).srv.URL)
+	cfg.Port = busy.Addr().(*net.TCPAddr).Port
+	e, err := New(cfg, WithLogger(quiet))
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // fails instead of hanging if Start succeeds
+	defer cancel()
+
+	err = e.Run(ctx)
+
+	require.ErrorContains(t, err, "listen executor port")
+}

@@ -47,18 +47,11 @@ func run(logger *slog.Logger) error {
 	exec.MustRegister("Hello", xxljob.HandlerFunc(hello))
 	exec.MustRegisterTasks(&SyncItemsTask{batchSize: 500}, ShardTask{})
 
-	if err := exec.Start(); err != nil {
-		return err
-	}
-
+	// Run until SIGINT/SIGTERM, then give running jobs ShutdownTimeout (20s by default) to finish; after that they
+	// are cancelled with xxljob.ErrShutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	<-ctx.Done()
-
-	// Give running jobs up to 30s to finish; after that they are cancelled with xxljob.ErrShutdown.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	return exec.Shutdown(shutdownCtx)
+	return exec.Run(ctx)
 }
 
 // hello is the smallest possible handler: everything logged through xxljob.Logger shows up in the admin's

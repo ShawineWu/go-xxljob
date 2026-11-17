@@ -16,8 +16,9 @@
 //		xxljob.Logger(ctx).Info("hello", "params", req.Params)
 //		return nil
 //	}))
-//	if err := exec.Start(); err != nil { ... }
-//	defer exec.Shutdown(shutdownCtx)
+//	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+//	defer stop()
+//	if err := exec.Run(ctx); err != nil { ... } // start, then shut down gracefully when ctx ends
 //
 // See the README for the execution model, block strategies, callbacks and shutdown.
 package xxljob
@@ -231,6 +232,25 @@ func (e *Executor) Start() error {
 	}
 	e.log.Info("xxljob: executor started", "app_name", e.cfg.AppName, "address", e.cfg.Address, "handlers", len(e.handlers))
 	return nil
+}
+
+// Run starts the executor, blocks until ctx is done, then shuts it down gracefully, giving running jobs
+// Config.ShutdownTimeout to finish. It is the usual way to run an executor from main:
+//
+//	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+//	defer stop()
+//	if err := exec.Run(ctx); err != nil { ... }
+//
+// It returns Start's error if the executor cannot start, and Shutdown's error (context.DeadlineExceeded) if running
+// jobs had to be cancelled; the end of ctx itself is a normal stop and returns nil.
+func (e *Executor) Run(ctx context.Context) error {
+	if err := e.Start(); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), e.cfg.ShutdownTimeout)
+	defer cancel()
+	return e.Shutdown(sctx)
 }
 
 // Shutdown stops the executor gracefully:

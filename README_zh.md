@@ -51,7 +51,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/ShawineWu/go-xxljob"
 )
@@ -71,17 +70,11 @@ func main() {
 		return nil
 	}))
 
-	if err := exec.Start(); err != nil { // 监听 :9999 并注册到调度中心
-		panic(err)
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	<-ctx.Done()
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	_ = exec.Shutdown(shutdownCtx) // 等执行中的任务结束，再注销
+	if err := exec.Run(ctx); err != nil { // 启动；收到 SIGINT/SIGTERM 后等执行中的任务结束，再注销
+		panic(err)
+	}
 }
 ```
 
@@ -206,6 +199,7 @@ XXL-JOB 3.5.0 修改了执行器协议，与旧版本不兼容，所以要按调
 | `RequestTimeout` | `3s` | 发往调度中心的单个请求的超时 |
 | `CallbackRetryInterval` | `10s` | 结果回调失败后的重试间隔 |
 | `MaxPendingCallbacks` | `10000` | 待发送结果的上限，超出时丢弃最旧的 |
+| `ShutdownTimeout` | `20s` | `Run` 的 ctx 结束后，等执行中的任务多久 |
 | `CancelWait` | `3s` | `Shutdown` 取消任务后再等多久 |
 
 传给 `New` 的选项：
@@ -222,10 +216,11 @@ XXL-JOB 3.5.0 修改了执行器协议，与旧版本不兼容，所以要按调
 
 ### 优雅退出
 
-`Shutdown(ctx)` 会拒绝新的调度、注销、等执行中的任务结束直到 `ctx` 超时、取消剩下的任务，并发出剩余的结果。要保证运行平台给足时间：
+`Run` 的 ctx 结束时（或调用 `Shutdown(ctx)` 时），执行器会拒绝新的调度、注销、最多等执行中的任务 `ShutdownTimeout`
+（或直到 `ctx` 超时）、取消剩下的任务，并发出剩余的结果。要保证运行平台给足时间：
 
 ```
-Shutdown 的 ctx 超时 + 约 10s  <  进程被强制结束前的时间
+ShutdownTimeout（默认 20s）+ 约 10s  <  进程被强制结束前的时间
 ```
 
 在 Kubernetes 上就是 `terminationGracePeriodSeconds`（默认 30s）。多出的约 10s 留给注销、`CancelWait` 和最后的回调。

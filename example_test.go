@@ -6,13 +6,16 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/ShawineWu/go-xxljob"
 )
 
 // This example creates an executor, registers a handler that decodes JSON parameters, writes to the execution log and
-// honors cancellation, then starts the executor and shuts it down gracefully.
+// honors cancellation, then runs the executor until the process is asked to stop.
 func Example() {
 	exec, err := xxljob.New(xxljob.Config{
 		AdminAddresses: []string{"http://xxl-job-admin:8080/xxl-job-admin"},
@@ -41,12 +44,12 @@ func Example() {
 		return nil
 	}))
 
-	if err := exec.Start(); err != nil {
+	// Run until SIGINT/SIGTERM, then shut down gracefully within Config.ShutdownTimeout.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := exec.Run(ctx); err != nil {
 		panic(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	_ = exec.Shutdown(ctx)
 }
 
 // This example mounts the executor on a subpath of an existing HTTP server instead of listening on a port of its own.

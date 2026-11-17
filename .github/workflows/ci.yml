@@ -3,7 +3,17 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore: # documentation-only changes do not need CI
+      - "**.md"
+      - LICENSE
+      - .github/ISSUE_TEMPLATE/**
+      - .github/pull_request_template.md
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - LICENSE
+      - .github/ISSUE_TEMPLATE/**
+      - .github/pull_request_template.md
 
 permissions:
   contents: read
@@ -85,7 +95,6 @@ jobs:
 
   e2e:
     name: e2e (xxl-job ${{ matrix.version }})
-    needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:

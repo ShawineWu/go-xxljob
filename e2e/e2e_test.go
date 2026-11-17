@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync"
@@ -495,6 +496,7 @@ func TestExecutorAgainstRealAdmin(t *testing.T) {
 			t.Logf("triggers without a result:\n%s", mysql(t, "SELECT id, job_id, trigger_time, LEFT(IFNULL(trigger_msg,''),80) FROM xxl_job_log "+
 				"WHERE job_id IN ("+in+") AND trigger_code=200 AND handle_code=0"))
 			t.Logf("executor stats: %+v", exec.Stats())
+			_ = pprof.Lookup("goroutine").WriteTo(os.Stderr, 1) // where the executor's goroutines are waiting
 			t.FailNow()
 		}
 		time.Sleep(6 * time.Second)

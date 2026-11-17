@@ -46,23 +46,20 @@ func run() error {
 	mux.Handle("/xxl-job/", http.StripPrefix("/xxl-job", exec.Handler()))
 	srv := &http.Server{Addr: ":8081", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
-	if err := exec.Start(); err != nil { // registry and callbacks only; srv serves the admin's requests
-		return err
-	}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("http server stopped", "err", err)
 		}
 	}()
 
+	// Run handles registration and callbacks (srv serves the admin's requests) until SIGINT/SIGTERM, then shuts
+	// the executor down. Stop the HTTP server only afterwards: the admin still needs it while jobs finish.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	<-ctx.Done()
+	err = exec.Run(ctx)
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	// Stop the executor first (it still needs the HTTP server while jobs finish), then the server.
-	err = exec.Shutdown(shutdownCtx)
 	return errors.Join(err, srv.Shutdown(shutdownCtx))
 }
 

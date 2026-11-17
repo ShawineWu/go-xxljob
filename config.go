@@ -22,6 +22,7 @@ const (
 	DefaultMaxPendingCallbacks   = 10000
 	DefaultMaxQueueSize          = 1000
 	DefaultCancelWait            = 3 * time.Second
+	DefaultShutdownTimeout       = 20 * time.Second
 	DefaultLongRunningThreshold  = time.Hour
 )
 
@@ -68,6 +69,10 @@ type Config struct {
 	MaxQueueSize int
 	// CancelWait is how long Shutdown waits for runs to return after cancelling them. Default 3s.
 	CancelWait time.Duration
+	// ShutdownTimeout is how long Run lets running jobs finish when its context ends, before cancelling them.
+	// Default 20s, which fits Kubernetes' default 30s termination grace period with room for deregistration,
+	// CancelWait and the last callbacks. It does not apply when calling Shutdown directly.
+	ShutdownTimeout time.Duration
 
 	// DefaultTimeout applies to runs the admin sends without a timeout (executorTimeout=0). 0 means no limit.
 	// A stuck handler that ignores its context blocks later triggers of the same job; a fallback timeout bounds it.
@@ -132,6 +137,7 @@ func (c Config) normalize() (Config, error) {
 	c.RequestTimeout = orDefault(c.RequestTimeout, DefaultRequestTimeout)
 	c.CallbackRetryInterval = orDefault(c.CallbackRetryInterval, DefaultCallbackRetryInterval)
 	c.CancelWait = orDefault(c.CancelWait, DefaultCancelWait)
+	c.ShutdownTimeout = orDefault(c.ShutdownTimeout, DefaultShutdownTimeout)
 	if c.MaxPendingCallbacks <= 0 {
 		c.MaxPendingCallbacks = DefaultMaxPendingCallbacks
 	}

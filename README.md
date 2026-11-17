@@ -56,7 +56,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/ShawineWu/go-xxljob"
 )
@@ -76,17 +75,11 @@ func main() {
 		return nil
 	}))
 
-	if err := exec.Start(); err != nil { // listens on :9999 and registers with the admin
-		panic(err)
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	<-ctx.Done()
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	_ = exec.Shutdown(shutdownCtx) // waits for running jobs, then deregisters
+	if err := exec.Run(ctx); err != nil { // starts, then on SIGINT/SIGTERM waits for running jobs and deregisters
+		panic(err)
+	}
 }
 ```
 
@@ -216,6 +209,7 @@ Only `AdminAddresses` and `AppName` are required.
 | `RequestTimeout` | `3s` | Timeout of each request to the admin |
 | `CallbackRetryInterval` | `10s` | Delay before retrying failed result callbacks |
 | `MaxPendingCallbacks` | `10000` | Cap on undelivered results; the oldest are dropped beyond it |
+| `ShutdownTimeout` | `20s` | How long `Run` lets running jobs finish when its context ends |
 | `CancelWait` | `3s` | How long `Shutdown` waits for runs after cancelling them |
 
 Options passed to `New`:
@@ -232,11 +226,12 @@ Options passed to `New`:
 
 ### Graceful shutdown
 
-On `Shutdown(ctx)` the executor stops accepting triggers, deregisters, waits for running jobs until `ctx` expires,
-cancels whatever is left, and delivers the remaining results. Make sure the platform gives it the time:
+When `Run`'s context ends (or on `Shutdown(ctx)`), the executor stops accepting triggers, deregisters, waits for
+running jobs for `ShutdownTimeout` (or until `ctx` expires), cancels whatever is left, and delivers the remaining
+results. Make sure the platform gives it the time:
 
 ```
-shutdown ctx timeout + ~10s  <  time before the process is killed
+ShutdownTimeout (default 20s) + ~10s  <  time before the process is killed
 ```
 
 On Kubernetes that is `terminationGracePeriodSeconds` (30s by default). The extra ~10s covers deregistration,

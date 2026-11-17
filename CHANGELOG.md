@@ -9,6 +9,8 @@ The executor (`github.com/ShawineWu/go-xxljob`) and the OpenTelemetry integratio
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-17
+
 First release.
 
 ### Added
@@ -21,7 +23,8 @@ First release.
   read in chunks of at most `MaxLogChunkBytes` (1 MB); the file store streams the file and never returns a line
   that is still being written.
 - Asynchronous, batched result callbacks with retries and admin failover.
-- Graceful `Shutdown`, `MaxConcurrency`, `DefaultTimeout`, `LongRunningThreshold`.
+- `Run(ctx)`: start, then shut down gracefully within `ShutdownTimeout` when the context ends; and `Shutdown` for
+  finer control. `MaxConcurrency`, `DefaultTimeout`, `LongRunningThreshold`.
 - `Stats` with current gauges (running, queued, pending callbacks), the registration state for readiness probes,
   and cumulative counters (accepted, rejected, succeeded, failed, timed out).
 - `Invoke` for running a handler without an admin (unit tests, manual runs).
@@ -30,4 +33,5 @@ First release.
   execution log) and `ObserveStats` (executor gauges and counters).
 - Unit, stress, fuzz and end-to-end tests (admin 2.4.1, 3.4.2, 3.5.0), and benchmarks.
 
-[Unreleased]: https://github.com/ShawineWu/go-xxljob/commits/main
+[Unreleased]: https://github.com/ShawineWu/go-xxljob/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/ShawineWu/go-xxljob/releases/tag/v0.1.0
