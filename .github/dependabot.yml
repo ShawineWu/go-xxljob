@@ -8,6 +8,20 @@ updates:
       go-dependencies:
         patterns: ["*"]
 
+  - package-ecosystem: gomod
+    directory: /otelxxljob
+    schedule:
+      interval: monthly
+    groups:
+      otelxxljob-dependencies:
+        patterns: ["*"]
+    ignore:
+      # The executor itself is used from this repository (replace ../); its version is set when releasing.
+      - dependency-name: github.com/ShawineWu/go-xxljob
+      # Keep the minimum OpenTelemetry version low so the module supports the same Go versions as the executor;
+      # applications pick newer versions themselves (minimum version selection).
+      - dependency-name: go.opentelemetry.io/*
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

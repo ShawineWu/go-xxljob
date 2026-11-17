@@ -2,16 +2,18 @@
 
 GO       ?= go
 VERSIONS ?= 2.4.1 3.4.2 3.5.0
+# Go modules in this repository: the executor and the OpenTelemetry integration.
+MODULES  := . otelxxljob
 
 .PHONY: check
-check: lint test ## Run lint and unit tests (what CI runs)
+check: lint test ## Run lint and unit tests for every module (what CI runs)
 
 .PHONY: test
 test: ## Run unit tests with the race detector
-	$(GO) test -race -count=1 ./...
+	@set -e; for m in $(MODULES); do (cd $$m && $(GO) test -race -count=1 ./...); done
 
 .PHONY: cover
-cover: ## Run unit tests with coverage and print the summary
+cover: ## Run the executor's unit tests with coverage and print the summary
 	$(GO) test -race -count=1 -coverprofile=coverage.out -covermode=atomic .
 	$(GO) tool cover -func=coverage.out | tail -1
 
@@ -31,16 +33,20 @@ fuzz: ## Run every fuzz target for FUZZTIME (default 30s)
 	@set -e; for f in $(FUZZ_TARGETS); do echo ">> $$f"; $(GO) test -run '^$$' -fuzz "^$$f$$" -fuzztime $(FUZZTIME) .; done
 
 .PHONY: lint
-lint: ## Run golangci-lint (v2)
-	golangci-lint run ./...
+lint: ## Run golangci-lint (v2) on every module
+	@set -e; for m in $(MODULES); do (cd $$m && golangci-lint run ./...); done
 
 .PHONY: fmt
 fmt: ## Format code
-	golangci-lint fmt ./...
+	@set -e; for m in $(MODULES); do (cd $$m && golangci-lint fmt ./...); done
+
+.PHONY: tidy
+tidy: ## Run go mod tidy in every module
+	@set -e; for m in $(MODULES); do (cd $$m && $(GO) mod tidy); done
 
 .PHONY: vuln
 vuln: ## Scan dependencies for known vulnerabilities
-	$(GO) run golang.org/x/vuln/cmd/govulncheck@latest ./...
+	@set -e; for m in $(MODULES); do (cd $$m && $(GO) run golang.org/x/vuln/cmd/govulncheck@latest ./...); done
 
 .PHONY: e2e
 e2e: ## Run end-to-end tests against a real xxl-job-admin (docker); XXL_JOB_VERSION=2.4.1|3.4.2|3.5.0

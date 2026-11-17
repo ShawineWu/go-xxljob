@@ -972,7 +972,7 @@ func TestStats(t *testing.T) {
 	busy := h.e.Stats()
 	close(g.release)
 	h.admin.callback(t, 3)
-	require.Eventually(t, func() bool { return h.e.Stats() == Stats{} }, time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return idle(h.e.Stats()) }, time.Second, 5*time.Millisecond)
 
 	assert.Equal(t, 1, busy.Running)
 	assert.Equal(t, 2, busy.Queued)
@@ -1110,7 +1110,8 @@ func TestShutdownRightAfterTrigger(t *testing.T) {
 	err := h.e.Shutdown(ctx)
 
 	require.NoError(t, err)
-	assert.Equal(t, Stats{Running: 1}, accepted)
+	assert.Equal(t, 1, accepted.Running)
+	assert.Zero(t, accepted.Queued)
 	assert.Equal(t, 200, h.admin.callback(t, 1).Code)
 }
 
@@ -1243,4 +1244,49 @@ func TestCustomHTTPClientAndLogStore(t *testing.T) {
 	defer store.mu.Unlock()
 	assert.Equal(t, 3, store.writes[7], "start, job line, end")
 	assert.True(t, store.closed)
+}
+
+// idle reports whether the executor has nothing running, queued or waiting to be reported.
+func idle(s Stats) bool { return s.Running == 0 && s.Queued == 0 && s.PendingCallbacks == 0 }
+
+func TestStatsCounters(t *testing.T) {
+	// Scenario: monitoring reads the cumulative counters and the registration state
+	// Given: one success, one failure, one timeout; one trigger rejected (unknown handler) and one rejected
+	//        (DISCARD_LATER while busy); a queued trigger discarded by a kill
+	// Expect: Accepted/Rejected count the triggers; Succeeded/Failed/TimedOut count the outcomes, a discarded trigger
+	//         counting as failed; Registered is true while heartbeats succeed and false after Shutdown
+	g := newGate()
+	h := newHarness(t, map[string]Handler{
+		"ok":   HandlerFunc(noop),
+		"fail": HandlerFunc(func(context.Context, *Request) error { return errors.New("x") }),
+		"slow": HandlerFunc(func(ctx context.Context, _ *Request) error { <-ctx.Done(); return ctx.Err() }),
+		"gate": g,
+	})
+	require.Eventually(t, func() bool { return h.e.Stats().Registered }, time.Second, 5*time.Millisecond)
+
+	h.run(t, runReq{JobID: 1, LogID: 1, ExecutorHandler: "ok"})
+	h.run(t, runReq{JobID: 2, LogID: 2, ExecutorHandler: "fail"})
+	h.run(t, runReq{JobID: 3, LogID: 3, ExecutorHandler: "slow", ExecutorTimeout: 1})
+	h.run(t, runReq{JobID: 4, LogID: 4, ExecutorHandler: "missing"})
+	h.run(t, runReq{JobID: 5, LogID: 5, ExecutorHandler: "gate"})
+	g.waitStart(t)
+	h.run(t, runReq{JobID: 5, LogID: 6, ExecutorHandler: "gate", ExecutorBlockStrategy: BlockDiscardLater})
+	h.run(t, runReq{JobID: 5, LogID: 7, ExecutorHandler: "gate"}) // queued behind log 5
+	h.post(t, "/kill", testToken, killReq{JobID: 5})              // kills log 5, discards log 7
+	for _, id := range []int64{1, 2, 3, 5, 7} {
+		h.admin.callback(t, id)
+	}
+	st := h.e.Stats()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.NoError(t, h.e.Shutdown(ctx))
+	after := h.e.Stats()
+
+	assert.Equal(t, int64(5), st.Accepted)
+	assert.Equal(t, int64(2), st.Rejected)
+	assert.Equal(t, int64(1), st.Succeeded)
+	assert.Equal(t, int64(3), st.Failed, "fail, killed and discarded")
+	assert.Equal(t, int64(1), st.TimedOut)
+	assert.True(t, st.Registered)
+	assert.False(t, after.Registered)
 }

@@ -34,6 +34,23 @@ make e2e-all  # all supported admin versions
   `CHANGELOG.md`.
 - **Commits.** Keep commits focused and write messages in the imperative mood ("Add …", "Fix …").
 
+## Repository layout
+
+The repository holds two Go modules: the executor at the root and the OpenTelemetry integration in
+[`otelxxljob/`](otelxxljob). `otelxxljob/go.mod` uses a `replace` directive to build against the executor in this
+repository, so changes to both can land in one pull request. The Makefile targets run on every module.
+
+## Releasing (maintainers)
+
+Both modules are released together with the same version (`vX.Y.Z` for the executor, `otelxxljob/vX.Y.Z` for the
+integration):
+
+1. Move the `Unreleased` entries in `CHANGELOG.md` under the new version, and make sure CI on `main` is green.
+2. Tag the executor and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`. The release workflow runs the tests
+   and creates the GitHub release.
+3. In `otelxxljob/`, require the new executor version (`go get github.com/ShawineWu/go-xxljob@vX.Y.Z`, keeping the
+   `replace`), commit, then tag and push `otelxxljob/vX.Y.Z`.
+
 ## Reporting security issues
 
 Please do not open public issues for vulnerabilities; see [SECURITY.md](SECURITY.md).

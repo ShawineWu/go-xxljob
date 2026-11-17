@@ -17,7 +17,8 @@ XXL-JOB 是广泛使用的分布式任务调度平台：**调度中心**决定�
 - **功能完整**：终止、超时、调度中心可查看的执行日志、分片广播、结果回调失败重试、优雅退出。
 - **默认安全**：每个请求校验 AccessToken，限制请求体大小，所有连接都有超时。
 - **易于测试**：`xxljob.Invoke` 不需要调度中心，按真实执行的方式跑一次任务。
-- **零依赖**：只依赖 Go 标准库。
+- **可观测**：`Stats` 提供累计计数和注册状态；可选的 OpenTelemetry 链路追踪与指标（[`otelxxljob`](#链路追踪与指标opentelemetry)）。
+- **零依赖**：只依赖 Go 标准库（OpenTelemetry 集成是独立的模块）。
 
 ## 目录
 
@@ -265,9 +266,42 @@ exec.Use(func(next xxljob.Handler) xxljob.Handler {
 
 只对某个任务生效的中间件，放在 `Register(name, handler, middlewares...)` 的参数里。调用链深处的代码可以用 `xxljob.RequestFrom(ctx)` 取到当前调度。
 
-### 指标
+### 链路追踪与指标（OpenTelemetry）
 
-`exec.Stats()` 返回执行中、排队中的调度数和待发送的结果数，可以导出为 gauge。`PendingCallbacks` 持续上涨说明调度中心连不上。
+[`otelxxljob`](otelxxljob) 模块（独立模块，执行器本身仍然零依赖）为每次执行生成链路，并导出执行器的运行状态：
+
+```bash
+go get github.com/ShawineWu/go-xxljob/otelxxljob
+```
+
+```go
+exec, err := xxljob.New(cfg, xxljob.WithMiddleware(otelxxljob.Middleware())) // 放在最外层
+// ...
+if _, err := otelxxljob.ObserveStats(exec); err != nil { ... }
+```
+
+- **`Middleware`**：每次执行一个 span（`xxljob {handler}`，带任务 ID、日志 ID、阻塞策略和分片），记录错误和 panic，
+  并区分失败、超时、被终止、被覆盖等结果（`xxljob.result`）；执行耗时记入 `xxljob.job.duration` 直方图；
+  trace ID 会写进执行日志，从调度中心的日志页面就能找到对应的链路。
+- **`ObserveStats`**：导出 `xxljob.executor.running`、`.queued`、`.pending_callbacks`、`.registered` 几个 gauge，
+  以及 `xxljob.executor.triggers`（accepted / rejected）和 `xxljob.executor.results`（success / failure / timeout）
+  两个计数器，都带 AppName 标签。
+
+默认使用全局的 OpenTelemetry provider，也可以用 `WithTracerProvider` / `WithMeterProvider` 指定。调度中心不会传递
+trace 上下文，所以每次执行都是一条新链路，任务内部产生的 span 会挂在它下面。想让应用日志也带上 trace ID，请用
+`xxljob.Logger(ctx).InfoContext(ctx, ...)`，并配合能识别 trace 的 `slog` handler。
+
+### 运行状态与健康检查
+
+不用 OpenTelemetry 时，`exec.Stats()` 是一个开销很小的快照，可以用于指标和探针：
+
+| 字段 | 类型 | |
+|---|---|---|
+| `Running`、`Queued` | gauge | 执行中（含等待并发空位的）和排队中的调度数 |
+| `PendingCallbacks` | gauge | 待发送的结果数；持续上涨说明调度中心连不上 |
+| `Registered` | 状态 | 最近一次注册心跳是否成功，可用于就绪探针 |
+| `Accepted`、`Rejected` | 计数 | 受理的调度数，以及被拒绝的（handler 不存在、丢弃后续调度、队列满等） |
+| `Succeeded`、`Failed`、`TimedOut` | 计数 | 回报的结果；每个受理的调度恰好落在其中一项 |
 
 ### 执行日志存储
 

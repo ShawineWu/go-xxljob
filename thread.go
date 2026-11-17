@@ -92,6 +92,17 @@ func newRequest(in runReq) *Request {
 //     only after the cancelled run returns);
 //   - SERIAL_EXECUTION (default): queue this trigger, or reject it when the queue is full.
 func (e *Executor) dispatch(in runReq) reply {
+	res := e.accept(in)
+	if res.code == codeSuccess {
+		e.counters.accepted.Add(1)
+	} else {
+		e.counters.rejected.Add(1)
+	}
+	return res
+}
+
+// accept validates a run request, applies the block strategy and queues it (see dispatch).
+func (e *Executor) accept(in runReq) reply {
 	if in.GlueType != "" && in.GlueType != glueTypeBean {
 		return failure(fmt.Sprintf("glue type [%s] is not supported, only BEAN", in.GlueType))
 	}
@@ -199,7 +210,7 @@ func (e *Executor) runThread(t *jobThread) {
 		t.running = next
 		e.mu.Unlock()
 
-		e.cb.push(res)
+		e.report(res)
 	}
 }
 
@@ -208,7 +219,7 @@ func (e *Executor) discard(tr *trigger, cause error) {
 	tr.cancel(cause)
 	_ = e.logs.Write(tr.ref(), "trigger discarded: "+cause.Error())
 	_ = e.logs.End(tr.ref())
-	e.cb.push(result{LogID: tr.req.LogID, LogTime: tr.logDateTime, Code: codeFail, Msg: "trigger discarded: " + cause.Error()})
+	e.report(result{LogID: tr.req.LogID, LogTime: tr.logDateTime, Code: codeFail, Msg: "trigger discarded: " + cause.Error()})
 }
 
 // execute runs one trigger (waiting for a concurrency slot first) and returns the result to report.

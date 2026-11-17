@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -63,6 +64,9 @@ type Executor struct {
 	threads     map[int64]*jobThread // jobId → job thread (exists while the job has a running or queued trigger)
 	wg          sync.WaitGroup       // job threads
 	sem         chan struct{}        // global concurrency limit (when MaxConcurrency > 0)
+
+	counters   counters
+	registered atomic.Bool // the last registry heartbeat succeeded
 
 	server       *http.Server
 	stopRegistry chan struct{}
@@ -295,7 +299,11 @@ func (e *Executor) shutdown(ctx context.Context) error {
 	return err
 }
 
-// Stats is a snapshot of the executor's activity.
+// Stats is a snapshot of the executor's activity, for metrics and health checks.
+//
+// Running, Queued and PendingCallbacks are current values (gauges). Accepted through TimedOut are totals since the
+// executor was created (counters). Every accepted trigger ends up in exactly one of Succeeded, Failed or TimedOut,
+// so Accepted - Succeeded - Failed - TimedOut is the number of triggers still in flight.
 type Stats struct {
 	// Running is the number of running triggers, including those waiting for a concurrency slot and those killed
 	// but not yet returned.
@@ -304,11 +312,38 @@ type Stats struct {
 	Queued int
 	// PendingCallbacks is the number of results waiting to be reported, including retries.
 	PendingCallbacks int
+	// Registered reports whether the last registry heartbeat succeeded. It is false before the first heartbeat,
+	// while the admin is unreachable, and after Shutdown; use it for readiness checks.
+	Registered bool
+
+	// Accepted counts triggers the executor accepted.
+	Accepted int64
+	// Rejected counts triggers the executor refused: unknown handler, DISCARD_LATER while busy, full queue,
+	// repeated log_id, unsupported glue type, not started or shutting down.
+	Rejected int64
+	// Succeeded counts runs reported as successful (200).
+	Succeeded int64
+	// Failed counts runs reported as failed (500): errors, panics, kills, covered or discarded triggers, shutdown.
+	Failed int64
+	// TimedOut counts runs reported as timed out (502).
+	TimedOut int64
 }
 
-// Stats returns a snapshot of the executor's activity, e.g. for metrics.
+// counters are the cumulative counts reported by Stats.
+type counters struct {
+	accepted, rejected, succeeded, failed, timedOut atomic.Int64
+}
+
+// Stats returns a snapshot of the executor's activity, e.g. for metrics and readiness checks.
 func (e *Executor) Stats() Stats {
-	var st Stats
+	st := Stats{
+		Registered: e.registered.Load(),
+		Accepted:   e.counters.accepted.Load(),
+		Rejected:   e.counters.rejected.Load(),
+		Succeeded:  e.counters.succeeded.Load(),
+		Failed:     e.counters.failed.Load(),
+		TimedOut:   e.counters.timedOut.Load(),
+	}
 	e.mu.Lock()
 	for _, t := range e.threads {
 		if t.running != nil {
@@ -319,6 +354,19 @@ func (e *Executor) Stats() Stats {
 	e.mu.Unlock()
 	st.PendingCallbacks = e.cb.pendingCount()
 	return st
+}
+
+// report counts a result and queues it for the admin.
+func (e *Executor) report(res result) {
+	switch res.Code {
+	case codeSuccess:
+		e.counters.succeeded.Add(1)
+	case codeTimeout:
+		e.counters.timedOut.Add(1)
+	default:
+		e.counters.failed.Add(1)
+	}
+	e.cb.push(res)
 }
 
 // waitGroup waits for wg or ctx and reports whether wg finished.

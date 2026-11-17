@@ -21,9 +21,15 @@ jobs:
         with:
           # golangci-lint can only load code for Go versions up to the one it was built with; keep these in step.
           go-version: "1.26"
-      - uses: golangci/golangci-lint-action@v9
+      - name: Lint executor
+        uses: golangci/golangci-lint-action@v9
         with:
           version: v2.11
+      - name: Lint otelxxljob
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.11
+          working-directory: otelxxljob
 
   test:
     name: test (go ${{ matrix.go }})
@@ -37,8 +43,11 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go }}
-      - name: Test
+      - name: Test executor
         run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+      - name: Test otelxxljob
+        working-directory: otelxxljob
+        run: go test -race -count=1 ./...
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1
       - name: Upload coverage
@@ -71,8 +80,8 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: stable
-      - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - name: govulncheck (every module)
+        run: make vuln
 
   e2e:
     name: e2e (xxl-job ${{ matrix.version }})

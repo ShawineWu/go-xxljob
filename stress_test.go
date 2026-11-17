@@ -175,6 +175,7 @@ func TestMultiJobStress(t *testing.T) {
 
 	var mu sync.Mutex
 	accepted := map[int64]bool{}
+	var nonTriggers atomic.Int64 // operations that are not triggers
 	work := make(chan op)
 	var wg sync.WaitGroup
 	for range workers {
@@ -193,12 +194,16 @@ func TestMultiJobStress(t *testing.T) {
 						mu.Unlock()
 					}
 				case 1:
+					nonTriggers.Add(1)
 					h.e.kill(int64(o.job))
 				case 2:
+					nonTriggers.Add(1)
 					h.e.idleBeat(int64(o.job))
 				case 3:
+					nonTriggers.Add(1)
 					h.e.readLog(logQuery{LogID: o.target, FromLine: 1})
 				case 4:
+					nonTriggers.Add(1)
 					_ = h.e.Stats()
 				}
 			}
@@ -211,7 +216,11 @@ func TestMultiJobStress(t *testing.T) {
 	wg.Wait()
 
 	checkCallbacks(t, h.admin, accepted)
-	require.Eventually(t, func() bool { return h.e.Stats() == Stats{} }, 5*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return idle(h.e.Stats()) }, 5*time.Second, 10*time.Millisecond)
+	st := h.e.Stats()
+	assert.Equal(t, int64(len(accepted)), st.Accepted)
+	assert.Equal(t, int64(ops)-st.Accepted, st.Rejected+nonTriggers.Load(), "every trigger is either accepted or rejected")
+	assert.Equal(t, st.Accepted, st.Succeeded+st.Failed+st.TimedOut, "every accepted trigger has exactly one outcome")
 	assert.Empty(t, guard.violations())
 	assert.NotEmpty(t, accepted)
 	t.Logf("accepted %d triggers", len(accepted))

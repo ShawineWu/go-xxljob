@@ -21,7 +21,9 @@ XXL-JOB is a widely used distributed task scheduler: the **admin** (scheduling c
   graceful shutdown.
 - **Secure by default:** access-token check on every request, body limits, timeouts on every connection.
 - **Easy to test:** `xxljob.Invoke` runs a handler without an admin, exactly as the executor would.
-- **Zero dependencies** beyond the Go standard library.
+- **Observable:** cumulative counters and health in `Stats`, and optional OpenTelemetry tracing and metrics
+  ([`otelxxljob`](#tracing-and-metrics-opentelemetry)).
+- **Zero dependencies** beyond the Go standard library (the OpenTelemetry integration is a separate module).
 
 ## Contents
 
@@ -279,10 +281,45 @@ exec.Use(func(next xxljob.Handler) xxljob.Handler {
 Middleware for a single job goes in `Register(name, handler, middlewares...)`. Code deeper in the call stack can
 read the current trigger with `xxljob.RequestFrom(ctx)`.
 
-### Metrics
+### Tracing and metrics (OpenTelemetry)
 
-`exec.Stats()` returns the number of running and queued triggers and pending callbacks; export it as gauges. A
-steadily growing `PendingCallbacks` means the admin is unreachable.
+The [`otelxxljob`](otelxxljob) module (separate, so the executor stays dependency-free) traces every run and
+exports the executor's state:
+
+```bash
+go get github.com/ShawineWu/go-xxljob/otelxxljob
+```
+
+```go
+exec, err := xxljob.New(cfg, xxljob.WithMiddleware(otelxxljob.Middleware())) // outermost middleware
+// ...
+if _, err := otelxxljob.ObserveStats(exec); err != nil { ... }
+```
+
+- **`Middleware`** starts a span per run (`xxljob {handler}`, with job ID, log ID, block strategy and shard), records
+  errors and panics, and tells failures, timeouts, kills and cover-early runs apart (`xxljob.result`). It records
+  run durations in the `xxljob.job.duration` histogram and writes the trace ID to the execution log, so a run in the
+  admin's log view leads straight to its trace.
+- **`ObserveStats`** exports `xxljob.executor.running`, `.queued`, `.pending_callbacks` and `.registered` gauges and
+  `xxljob.executor.triggers` (accepted / rejected) and `xxljob.executor.results` (success / failure / timeout)
+  counters, tagged with the AppName.
+
+Both use the global OpenTelemetry providers unless `WithTracerProvider` / `WithMeterProvider` is given. The admin
+does not propagate trace context, so each run starts a new trace; spans created inside the job become its children.
+To get the trace ID in your application logs too, log with `xxljob.Logger(ctx).InfoContext(ctx, ...)` through a
+trace-aware `slog` handler.
+
+### Stats and health checks
+
+`exec.Stats()` is a cheap snapshot for metrics and probes, if you don't use OpenTelemetry:
+
+| Field | Kind | |
+|---|---|---|
+| `Running`, `Queued` | gauge | Triggers running (including those waiting for a concurrency slot) and queued |
+| `PendingCallbacks` | gauge | Results waiting to be reported; a steady rise means the admin is unreachable |
+| `Registered` | state | The last registry heartbeat succeeded; use it for a readiness probe |
+| `Accepted`, `Rejected` | counter | Triggers accepted, and refused (unknown handler, discard later, queue full, …) |
+| `Succeeded`, `Failed`, `TimedOut` | counter | Reported outcomes; every accepted trigger ends in exactly one of them |
 
 ### Execution log storage
 

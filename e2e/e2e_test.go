@@ -529,9 +529,14 @@ func TestExecutorAgainstRealAdmin(t *testing.T) {
 	})
 
 	t.Run("shutdown deregisters the executor", func(t *testing.T) {
+		before := exec.Stats()
 		err := shutdown()
 
 		require.NoError(t, err)
+		after := exec.Stats()
+		assert.True(t, before.Registered, "registered with the real admin before shutdown")
+		assert.False(t, after.Registered)
+		assert.Equal(t, after.Accepted, after.Succeeded+after.Failed+after.TimedOut, "every accepted trigger has an outcome")
 		assert.Equal(t, "0", mysql(t, "SELECT COUNT(*) FROM xxl_job_registry WHERE registry_key='"+appName+"'"))
 	})
 }

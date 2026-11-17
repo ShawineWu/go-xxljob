@@ -25,6 +25,7 @@ func (e *Executor) registryLoop() {
 			e.log.Info("xxljob: registry recovered", "app_name", e.cfg.AppName, "address", e.cfg.Address)
 		}
 		healthy = err == nil
+		e.registered.Store(healthy)
 		select {
 		case <-e.stopRegistry:
 			return
@@ -35,6 +36,7 @@ func (e *Executor) registryLoop() {
 
 // deregister removes the executor from the admin, so no more triggers are routed to this instance.
 func (e *Executor) deregister(ctx context.Context) {
+	e.registered.Store(false)
 	if err := e.admin.post(ctx, "registryRemove", e.registryParam()); err != nil {
 		e.log.Error("xxljob: registryRemove failed", "app_name", e.cfg.AppName, "address", e.cfg.Address, "err", err)
 	}
