@@ -37,7 +37,7 @@ func run() error {
 		return err
 	}
 	exec.MustRegister("Hello", xxljob.HandlerFunc(func(ctx context.Context, req *xxljob.Request) error {
-		xxljob.Logger(ctx).Info("hello from an embedded executor")
+		xxljob.Logger(ctx).InfoContext(ctx, "hello from an embedded executor")
 		return nil
 	}))
 

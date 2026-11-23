@@ -1,23 +1,26 @@
 // Package otelxxljob adds OpenTelemetry tracing and metrics to a go-xxljob executor.
 //
-// It lives in its own module so the executor itself keeps depending on the standard library only.
+// It lives in its own module so the executor itself keeps depending on the standard library only. One call
+// instruments an executor (before it starts):
 //
-//	exec.Use(otelxxljob.Middleware())                 // a span and a duration measurement per run
-//	if _, err := otelxxljob.ObserveStats(exec); err != nil { ... } // executor gauges and counters
+//	if _, err := otelxxljob.Instrument(exec); err != nil { ... }
 //
-// Both use the global providers (otel.GetTracerProvider, otel.GetMeterProvider) unless WithTracerProvider or
-// WithMeterProvider is given.
+// Instrument installs Middleware (a span and a duration measurement per run) and ObserveStats (the executor's
+// gauges and counters), both tagged with the executor's AppName. They use the global providers
+// (otel.GetTracerProvider, otel.GetMeterProvider) unless WithTracerProvider or WithMeterProvider is given.
 //
 // The admin does not propagate trace context when it triggers a job, so every run starts a new trace. Spans created
 // inside the job (database, HTTP, RPC clients) become its children. The run's trace ID is also written to the
-// execution log, so it can be found from the admin's log view.
+// execution log, so a run in the admin's log view leads to its trace.
 package otelxxljob
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -56,12 +59,16 @@ const (
 	ResultShutdown       = "shutdown"
 )
 
-// Option configures Middleware and ObserveStats.
+// maxStatusDescription caps the error text put on a span: errors can be long and may carry data from job parameters.
+const maxStatusDescription = 512
+
+// Option configures Instrument, Middleware and ObserveStats.
 type Option func(*config)
 
 type config struct {
 	tp         trace.TracerProvider
 	mp         metric.MeterProvider
+	attrs      []attribute.KeyValue
 	logTraceID bool
 }
 
@@ -89,10 +96,28 @@ func WithMeterProvider(mp metric.MeterProvider) Option {
 	return func(c *config) { c.mp = mp }
 }
 
+// WithAttributes adds attributes to every span and measurement. Keep them low-cardinality.
+func WithAttributes(attrs ...attribute.KeyValue) Option {
+	return func(c *config) { c.attrs = append(c.attrs, attrs...) }
+}
+
 // WithLogTraceID controls whether Middleware writes the run's trace ID to the execution log (and the application
 // log) when a run starts. Default true.
 func WithLogTraceID(enabled bool) Option {
 	return func(c *config) { c.logTraceID = enabled }
+}
+
+// Instrument installs Middleware on exec and registers ObserveStats, both tagged with exec's AppName. Call it before
+// Start, and before adding other middlewares with Use if the span should cover them: the middleware applies to
+// triggers accepted afterwards, around the middlewares added after it.
+func Instrument(exec *xxljob.Executor, opts ...Option) (metric.Registration, error) {
+	opts = append(slices.Clone(opts), WithAttributes(AttrAppName.String(exec.Config().AppName)))
+	reg, err := ObserveStats(exec, opts...)
+	if err != nil {
+		return nil, err
+	}
+	exec.Use(Middleware(opts...))
+	return reg, nil
 }
 
 // Middleware returns an xxljob.Middleware that, for every run:
@@ -102,9 +127,9 @@ func WithLogTraceID(enabled bool) Option {
 //   - records the run's duration in the xxljob.job.duration histogram (seconds), by handler and result;
 //   - writes the trace ID to the execution log (see WithLogTraceID).
 //
-// The result (AttrResult) distinguishes plain failures from panics, timeouts, kills and the other cancellation
-// causes. Install it with Executor.Use or WithMiddleware; it should be the outermost middleware so the span covers
-// the others. Panics are recorded and then re-raised for the executor to report.
+// The result (AttrResult) tells plain failures from panics, timeouts, kills and the other cancellation causes.
+// Panics are recorded and then re-raised for the executor to report. Prefer Instrument, which also tags everything
+// with the executor's AppName.
 func Middleware(opts ...Option) xxljob.Middleware {
 	c := newConfig(opts)
 	tracer := c.tp.Tracer(ScopeName)
@@ -119,7 +144,7 @@ func Middleware(opts ...Option) xxljob.Middleware {
 	return func(next xxljob.Handler) xxljob.Handler {
 		return xxljob.HandlerFunc(func(ctx context.Context, req *xxljob.Request) (err error) {
 			ctx, span := tracer.Start(ctx, "xxljob "+req.Handler,
-				trace.WithSpanKind(trace.SpanKindConsumer), trace.WithAttributes(requestAttrs(req)...))
+				trace.WithSpanKind(trace.SpanKindConsumer), trace.WithAttributes(requestAttrs(req, c.attrs)...))
 			if sc := span.SpanContext(); c.logTraceID && sc.IsValid() {
 				xxljob.Logger(ctx).InfoContext(ctx, "trace", "trace_id", sc.TraceID().String(), "span_id", sc.SpanID().String())
 			}
@@ -129,12 +154,12 @@ func Middleware(opts ...Option) xxljob.Middleware {
 				span.SetAttributes(AttrResult.String(result))
 				if err != nil {
 					span.RecordError(err)
-					span.SetStatus(codes.Error, err.Error())
+					span.SetStatus(codes.Error, clip(err.Error(), maxStatusDescription))
 				}
 				span.End()
 				if duration != nil {
-					duration.Record(context.WithoutCancel(ctx), time.Since(start).Seconds(),
-						metric.WithAttributes(AttrHandler.String(req.Handler), AttrResult.String(result)))
+					attrs := append([]attribute.KeyValue{AttrHandler.String(req.Handler), AttrResult.String(result)}, c.attrs...)
+					duration.Record(context.WithoutCancel(ctx), time.Since(start).Seconds(), metric.WithAttributes(attrs...))
 				}
 			}
 			defer func() {
@@ -151,7 +176,7 @@ func Middleware(opts ...Option) xxljob.Middleware {
 	}
 }
 
-func requestAttrs(req *xxljob.Request) []attribute.KeyValue {
+func requestAttrs(req *xxljob.Request, extra []attribute.KeyValue) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{
 		AttrHandler.String(req.Handler),
 		AttrJobID.Int64(req.JobID),
@@ -163,16 +188,13 @@ func requestAttrs(req *xxljob.Request) []attribute.KeyValue {
 	if req.ShardTotal > 1 {
 		attrs = append(attrs, AttrShardIndex.Int(req.ShardIndex), AttrShardTotal.Int(req.ShardTotal))
 	}
-	return attrs
+	return append(attrs, extra...)
 }
 
-// resultOf classifies a finished run by its error and the cancellation cause of its context.
+// resultOf classifies a finished run by the cancellation cause of its context, which wins over what the handler
+// returned (as it does for the result the executor reports), then by its error.
 func resultOf(ctx context.Context, err error) string {
-	if err == nil {
-		return ResultSuccess
-	}
-	cause := context.Cause(ctx)
-	switch {
+	switch cause := context.Cause(ctx); {
 	case errors.Is(cause, xxljob.ErrTimeout):
 		return ResultTimeout
 	case errors.Is(cause, xxljob.ErrKilled):
@@ -183,62 +205,63 @@ func resultOf(ctx context.Context, err error) string {
 		return ResultHandlerChanged
 	case errors.Is(cause, xxljob.ErrShutdown):
 		return ResultShutdown
+	case err != nil:
+		return ResultFailure
 	}
-	return ResultFailure
+	return ResultSuccess
 }
 
-// ObserveStats registers instruments that report exec.Stats() on every collection, tagged with the executor's
-// AppName:
+// ObserveStats registers instruments that report exec.Stats() on every collection:
 //
-//	xxljob.executor.running            gauge    running triggers
-//	xxljob.executor.queued             gauge    queued triggers
-//	xxljob.executor.pending_callbacks  gauge    results waiting to be reported (rising: the admin is unreachable)
-//	xxljob.executor.registered         gauge    1 while the registry heartbeat succeeds, else 0
-//	xxljob.executor.triggers           counter  triggers by xxljob.trigger: accepted / rejected
-//	xxljob.executor.results            counter  reported results by xxljob.result: success / failure / timeout
+//	xxljob.executor.running            up-down counter  jobs with a running trigger
+//	xxljob.executor.queued             up-down counter  queued triggers
+//	xxljob.executor.pending_callbacks  up-down counter  results not yet delivered (rising: the admin is unreachable)
+//	xxljob.executor.registered         gauge            1 while the registry heartbeat succeeds, else 0
+//	xxljob.executor.triggers           counter          triggers by xxljob.trigger: accepted / rejected
+//	xxljob.executor.results            counter          reported results by xxljob.result: success / failure / timeout
 //
 // Unlike Middleware, the counters also see triggers that never run: rejected ones and queued ones discarded by a
 // kill, a newer trigger or shutdown. Call Unregister on the returned registration to stop reporting.
 func ObserveStats(exec *xxljob.Executor, opts ...Option) (metric.Registration, error) {
 	c := newConfig(opts)
 	meter := c.mp.Meter(ScopeName)
-	appName := AttrAppName.String(exec.Config().AppName)
-	app := metric.WithAttributes(appName)
+	with := func(extra ...attribute.KeyValue) metric.ObserveOption {
+		return metric.WithAttributes(append(slices.Clone(c.attrs), extra...)...)
+	}
 
 	var errs []error
-	gauge := func(name, desc, unit string) metric.Int64ObservableGauge {
-		g, err := meter.Int64ObservableGauge(name, metric.WithDescription(desc), metric.WithUnit(unit))
+	upDown := func(name, desc, unit string) metric.Int64ObservableUpDownCounter {
+		i, err := meter.Int64ObservableUpDownCounter(name, metric.WithDescription(desc), metric.WithUnit(unit))
 		errs = append(errs, err)
-		return g
+		return i
 	}
-	counter := func(name, desc, unit string) metric.Int64ObservableCounter {
-		g, err := meter.Int64ObservableCounter(name, metric.WithDescription(desc), metric.WithUnit(unit))
-		errs = append(errs, err)
-		return g
-	}
-	running := gauge("xxljob.executor.running", "Running triggers, including those waiting for a concurrency slot.", "{trigger}")
-	queued := gauge("xxljob.executor.queued", "Queued triggers (serial execution).", "{trigger}")
-	pending := gauge("xxljob.executor.pending_callbacks", "Results waiting to be reported to the admin.", "{result}")
-	registered := gauge("xxljob.executor.registered", "1 while the executor is registered with the admin.", "1")
-	triggers := counter("xxljob.executor.triggers", "Triggers received, by whether they were accepted.", "{trigger}")
-	results := counter("xxljob.executor.results", "Results reported to the admin, by outcome.", "{result}")
+	running := upDown("xxljob.executor.running", "Jobs with a running trigger, including triggers waiting for a slot.", "{trigger}")
+	queued := upDown("xxljob.executor.queued", "Queued triggers (serial execution).", "{trigger}")
+	pending := upDown("xxljob.executor.pending_callbacks", "Results not yet delivered to the admin.", "{result}")
+	registered, err := meter.Int64ObservableGauge("xxljob.executor.registered",
+		metric.WithDescription("1 while the executor is registered with the admin."), metric.WithUnit("1"))
+	errs = append(errs, err)
+	triggers, err := meter.Int64ObservableCounter("xxljob.executor.triggers",
+		metric.WithDescription("Triggers received, by whether they were accepted."), metric.WithUnit("{trigger}"))
+	errs = append(errs, err)
+	results, err := meter.Int64ObservableCounter("xxljob.executor.results",
+		metric.WithDescription("Results reported to the admin, by outcome."), metric.WithUnit("{result}"))
+	errs = append(errs, err)
 	if err := errors.Join(errs...); err != nil {
 		return nil, err
 	}
 
-	accepted := metric.WithAttributes(appName, AttrTrigger.String("accepted"))
-	rejected := metric.WithAttributes(appName, AttrTrigger.String("rejected"))
-	outcome := func(result string) metric.ObserveOption {
-		return metric.WithAttributes(appName, AttrResult.String(result))
-	}
-	success, failure, timeout := outcome(ResultSuccess), outcome(ResultFailure), outcome(ResultTimeout)
+	plain := with()
+	accepted, rejected := with(AttrTrigger.String("accepted")), with(AttrTrigger.String("rejected"))
+	success, failure := with(AttrResult.String(ResultSuccess)), with(AttrResult.String(ResultFailure))
+	timeout := with(AttrResult.String(ResultTimeout))
 
 	return meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		st := exec.Stats()
-		o.ObserveInt64(running, int64(st.Running), app)
-		o.ObserveInt64(queued, int64(st.Queued), app)
-		o.ObserveInt64(pending, int64(st.PendingCallbacks), app)
-		o.ObserveInt64(registered, boolToInt(st.Registered), app)
+		o.ObserveInt64(running, int64(st.Running), plain)
+		o.ObserveInt64(queued, int64(st.Queued), plain)
+		o.ObserveInt64(pending, int64(st.PendingCallbacks), plain)
+		o.ObserveInt64(registered, boolToInt(st.Registered), plain)
 		o.ObserveInt64(triggers, st.Accepted, accepted)
 		o.ObserveInt64(triggers, st.Rejected, rejected)
 		o.ObserveInt64(results, st.Succeeded, success)
@@ -253,4 +276,15 @@ func boolToInt(b bool) int64 {
 		return 1
 	}
 	return 0
+}
+
+// clip shortens s to at most n bytes, on a rune boundary.
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + "..."
 }

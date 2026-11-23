@@ -1,0 +1,510 @@
+// Package sched runs job triggers. Each job (jobId) has a job thread that runs its triggers one at a time, in order;
+// block strategies decide what happens to a trigger that arrives while the job is busy. The scheduler knows nothing
+// about HTTP, the wire protocol or the admin: it receives triggers and reports exactly one outcome for each accepted
+// one.
+//
+// Every accepted trigger is a run with an explicit phase:
+//
+//		queued ──► ready ──► waiting ──► running ──► cancelling
+//		   │         │          │           │            │
+//		   └─────────┴──────────┴───────────┴────────────┴──► finished
+//
+//	  - queued: in its job's queue;
+//	  - ready: its job's current run, about to take a concurrency slot;
+//	  - waiting: blocked on a concurrency slot (discarded by Close like a queued run);
+//	  - running: Run has been called;
+//	  - cancelling: cancelled (kill, cover, handler change, timeout, shutdown) and already reported, Run not returned;
+//	  - finished: done; its resources are released.
+//
+// Phases change only through to. Outcomes leave only through settle, once per run; resources are released only
+// through retire, once per run. The number of runs not finished is capped (Config.MaxActive), which bounds the job
+// goroutines and everything a run holds.
+package sched
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+)
+
+// Causes a run's context is cancelled with. They are reported to the admin as the run's result.
+var (
+	ErrKilled         = errors.New("xxljob: job killed by the scheduling center")
+	ErrCovered        = errors.New("xxljob: job covered by a newer trigger")
+	ErrHandlerChanged = errors.New("xxljob: job handler changed")
+	ErrTimeout        = errors.New("xxljob: job execution timeout")
+	ErrShutdown       = errors.New("xxljob: executor is shutting down")
+)
+
+// Reasons a trigger is rejected.
+var (
+	ErrDiscardLater = errors.New("block strategy DISCARD_LATER: job is still running")
+	ErrQueueFull    = errors.New("job queue is full")
+	ErrBusy         = errors.New("executor is busy")
+	ErrRepeated     = errors.New("repeated trigger: log_id is already running or queued")
+)
+
+// Block strategies (the admin's executorBlockStrategy).
+const (
+	Serial       = "SERIAL_EXECUTION"
+	DiscardLater = "DISCARD_LATER"
+	CoverEarly   = "COVER_EARLY"
+)
+
+// Result codes.
+const (
+	CodeSuccess = 200
+	CodeFail    = 500
+	CodeTimeout = 502
+)
+
+// Trigger is one trigger of a job.
+type Trigger struct {
+	JobID    int64
+	LogID    int64
+	LogTime  int64  // opaque to the scheduler; carried for the reporter
+	Handler  string // a change of handler cancels the job's running trigger
+	Strategy string // one of the block strategies; anything else means Serial
+	Timeout  time.Duration
+	// Run executes the trigger and returns its outcome. It is called at most once, with a context that is cancelled
+	// with one of the causes above, and it must return (it may return after its outcome was already reported).
+	Run func(ctx context.Context) Outcome
+}
+
+// Outcome is the result reported for a trigger.
+type Outcome struct {
+	Code int
+	Msg  string
+	// Started is false when the trigger was discarded or cancelled before its Run was called.
+	Started bool
+}
+
+// Reporter receives the outcome of every accepted trigger, exactly once. It is called without the scheduler's lock
+// held, possibly from several goroutines at once.
+type Reporter func(tr *Trigger, o Outcome)
+
+// Config limits the scheduler. Zero values mean no limit.
+type Config struct {
+	MaxQueue       int // queued triggers per job
+	MaxActive      int // accepted triggers not finished yet (running, waiting or queued), across all jobs
+	MaxConcurrency int // runs executing at once across all jobs
+}
+
+// Stats is a consistent snapshot of the scheduler: Accepted - Succeeded - Failed - TimedOut triggers have not been
+// reported yet.
+type Stats struct {
+	Running   int // jobs whose current run is ready, waiting, running or cancelling
+	Queued    int
+	Active    int // runs not finished
+	Accepted  int64
+	Rejected  int64
+	Succeeded int64
+	Failed    int64
+	TimedOut  int64
+}
+
+type phase uint8
+
+const (
+	queued phase = iota
+	ready
+	waiting
+	running
+	cancelling
+	finished
+)
+
+var phaseNames = [...]string{"queued", "ready", "waiting", "running", "cancelling", "finished"}
+
+func (p phase) String() string { return phaseNames[p] }
+
+// next lists the phases each phase may move to.
+var next = [...][]phase{
+	queued:     {ready, finished},
+	ready:      {waiting, running, finished},
+	waiting:    {running, finished},
+	running:    {cancelling, finished},
+	cancelling: {finished},
+	finished:   nil,
+}
+
+// Scheduler runs triggers. It is safe for concurrent use.
+type Scheduler struct {
+	cfg    Config
+	report Reporter
+	sem    chan struct{} // nil without a concurrency limit
+
+	mu      sync.Mutex
+	closing bool
+	threads map[int64]*thread
+	logIDs  map[int64]struct{} // log IDs of every run not finished, across jobs
+	changed chan struct{}      // closed and replaced whenever a run finishes
+	stats   Stats              // counters, Queued and Active; Running is computed
+
+	wg sync.WaitGroup // job thread goroutines
+}
+
+// thread is the state of one job. It exists while the job has a current or queued run.
+type thread struct {
+	jobID   int64
+	handler string
+	current *run
+	queue   []*run
+}
+
+// run is one accepted trigger. phase and reported are guarded by Scheduler.mu.
+type run struct {
+	tr        *Trigger
+	ctx       context.Context
+	cancel    context.CancelCauseFunc
+	phase     phase
+	reported  bool
+	delivered chan struct{} // closed once the Reporter has returned for this run
+}
+
+// New returns a scheduler that reports outcomes to report.
+func New(cfg Config, report Reporter) *Scheduler {
+	s := &Scheduler{cfg: cfg, report: report, threads: map[int64]*thread{}, logIDs: map[int64]struct{}{},
+		changed: make(chan struct{})}
+	if cfg.MaxConcurrency > 0 {
+		s.sem = make(chan struct{}, cfg.MaxConcurrency)
+	}
+	return s
+}
+
+// Submit accepts a trigger or rejects it with an error that explains why (shown in the admin's trigger log).
+func (s *Scheduler) Submit(tr *Trigger) error {
+	dropped, cause, err := s.submit(tr)
+	s.discard(dropped, cause)
+	return err
+}
+
+func (s *Scheduler) submit(tr *Trigger) (dropped []*run, cause, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	defer func() {
+		if err != nil {
+			s.stats.Rejected++
+		}
+	}()
+	_, dup := s.logIDs[tr.LogID] // log IDs key execution logs and results, across jobs
+	switch {
+	case s.closing:
+		return nil, nil, ErrShutdown
+	case dup:
+		return nil, nil, fmt.Errorf("%w (log_id %d)", ErrRepeated, tr.LogID)
+	case s.cfg.MaxActive > 0 && s.stats.Active >= s.cfg.MaxActive:
+		return nil, nil, fmt.Errorf("%w (%d triggers running or queued)", ErrBusy, s.stats.Active)
+	}
+	t := s.threads[tr.JobID]
+	if t == nil {
+		r := s.admit(tr)
+		s.to(r, ready)
+		t = &thread{jobID: tr.JobID, handler: tr.Handler, current: r}
+		s.threads[tr.JobID] = t
+		s.wg.Go(func() { s.loop(t) })
+		return nil, nil, nil
+	}
+	switch {
+	case t.handler != tr.Handler:
+		cause = ErrHandlerChanged
+		dropped = s.abort(t, cause)
+		t.handler = tr.Handler
+	case tr.Strategy == DiscardLater:
+		return nil, nil, ErrDiscardLater
+	case tr.Strategy == CoverEarly:
+		cause = ErrCovered
+		dropped = s.abort(t, cause)
+	case s.cfg.MaxQueue > 0 && len(t.queue) >= s.cfg.MaxQueue:
+		return nil, nil, fmt.Errorf("%w (%d triggers of this job waiting)", ErrQueueFull, len(t.queue))
+	}
+	t.queue = append(t.queue, s.admit(tr))
+	s.stats.Queued++
+	return dropped, cause, nil
+}
+
+// admit records a newly accepted trigger as a queued run. Called with s.mu held.
+func (s *Scheduler) admit(tr *Trigger) *run {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	s.logIDs[tr.LogID] = struct{}{}
+	s.stats.Accepted++
+	s.stats.Active++
+	return &run{tr: tr, ctx: ctx, cancel: cancel, phase: queued, delivered: make(chan struct{})}
+}
+
+// to moves r to phase p. Called with s.mu held; an illegal move is a bug.
+func (s *Scheduler) to(r *run, p phase) {
+	for _, ok := range next[r.phase] {
+		if ok == p {
+			r.phase = p
+			return
+		}
+	}
+	panic(fmt.Sprintf("sched: illegal phase change %s -> %s (log_id %d)", r.phase, p, r.tr.LogID))
+}
+
+// settle reports r's outcome. It is the only way an outcome leaves the scheduler, and it reports once per run; the
+// run cannot finish before the report has been delivered (see retire).
+func (s *Scheduler) settle(r *run, o Outcome) {
+	s.mu.Lock()
+	if r.reported {
+		s.mu.Unlock()
+		return
+	}
+	r.reported = true
+	switch o.Code {
+	case CodeSuccess:
+		s.stats.Succeeded++
+	case CodeTimeout:
+		s.stats.TimedOut++
+	default:
+		s.stats.Failed++
+	}
+	s.mu.Unlock()
+	defer close(r.delivered)
+	s.report(r.tr, o)
+}
+
+// retire finishes r and releases what it holds. It is called once per run, after settle; it waits until the
+// outcome has been delivered, which may happen on another goroutine (a cancellation), so that a finished run never
+// has a report still in progress.
+func (s *Scheduler) retire(r *run) {
+	<-r.delivered
+	r.cancel(nil)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.to(r, finished)
+	delete(s.logIDs, r.tr.LogID)
+	s.stats.Active--
+	close(s.changed)
+	s.changed = make(chan struct{})
+}
+
+// Kill cancels the job's current run and discards its queued ones. It reports whether the job was busy.
+func (s *Scheduler) Kill(jobID int64) bool {
+	s.mu.Lock()
+	t := s.threads[jobID]
+	var dropped []*run
+	if t != nil {
+		dropped = s.abort(t, ErrKilled)
+	}
+	s.mu.Unlock()
+	s.discard(dropped, ErrKilled)
+	return t != nil
+}
+
+// Busy reports whether the job has a current or queued run.
+func (s *Scheduler) Busy(jobID int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.threads[jobID] != nil
+}
+
+// Stats returns a consistent snapshot.
+func (s *Scheduler) Stats() Stats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := s.stats
+	for _, t := range s.threads {
+		if t.current != nil {
+			st.Running++
+		}
+	}
+	return st
+}
+
+// Close stops accepting triggers and discards the queued ones, as well as runs waiting for a concurrency slot. It
+// waits for the other runs until ctx is done, then cancels them with ErrShutdown and waits grace more. It returns
+// ctx's error if runs had to be cancelled, nil otherwise.
+func (s *Scheduler) Close(ctx context.Context, grace time.Duration) error {
+	s.mu.Lock()
+	s.closing = true
+	var dropped []*run
+	for _, t := range s.threads {
+		dropped = append(dropped, t.queue...)
+		s.stats.Queued -= len(t.queue)
+		t.queue = nil
+		if r := t.current; r != nil && r.phase == waiting {
+			r.cancel(ErrShutdown)
+		}
+	}
+	s.mu.Unlock()
+	s.discard(dropped, ErrShutdown)
+
+	if s.waitIdle(ctx) {
+		s.wg.Wait()
+		return nil
+	}
+	s.mu.Lock()
+	for _, t := range s.threads {
+		if t.current != nil {
+			t.current.cancel(ErrShutdown)
+		}
+	}
+	s.mu.Unlock()
+	gctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+	if s.waitIdle(gctx) {
+		s.wg.Wait()
+	}
+	return ctx.Err()
+}
+
+// waitIdle waits until every run has finished, or ctx is done. Being idle wins over an expired ctx.
+func (s *Scheduler) waitIdle(ctx context.Context) bool {
+	for {
+		s.mu.Lock()
+		idle := s.stats.Active == 0
+		changed := s.changed
+		s.mu.Unlock()
+		if idle {
+			return true
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return false
+		}
+	}
+}
+
+// abort cancels the job's current run with cause and removes the queued ones, which the caller discards. Called
+// with s.mu held.
+func (s *Scheduler) abort(t *thread, cause error) []*run {
+	if t.current != nil {
+		t.current.cancel(cause)
+	}
+	dropped := t.queue
+	t.queue = nil
+	s.stats.Queued -= len(dropped)
+	return dropped
+}
+
+// discard settles and retires runs removed from a queue before they started.
+func (s *Scheduler) discard(dropped []*run, cause error) {
+	for _, r := range dropped {
+		s.settle(r, Outcome{Code: CodeFail, Msg: "trigger discarded: " + cause.Error()})
+		s.retire(r)
+	}
+}
+
+// loop is the job thread: it executes the job's runs one by one and removes the thread when the queue is empty. The
+// next run becomes current under the same lock that ends the previous one, so the job never looks idle in between.
+func (s *Scheduler) loop(t *thread) {
+	s.mu.Lock()
+	r := t.current
+	s.mu.Unlock()
+	for r != nil {
+		s.execute(r)
+		s.mu.Lock()
+		r = nil
+		if len(t.queue) > 0 {
+			r = t.queue[0]
+			t.queue[0] = nil
+			t.queue = t.queue[1:]
+			s.stats.Queued--
+			s.to(r, ready)
+		} else {
+			delete(s.threads, t.jobID)
+		}
+		t.current = r
+		s.mu.Unlock()
+	}
+}
+
+// execute takes a concurrency slot, then runs r. A cancellation is reported the moment it happens, even if Run has
+// not returned; the job stays busy until it does, so its runs never overlap.
+func (s *Scheduler) execute(r *run) {
+	defer s.retire(r)
+	if !s.acquire(r) {
+		s.settle(r, outcomeOf(context.Cause(r.ctx), false))
+		return
+	}
+	if s.sem != nil {
+		defer func() { <-s.sem }()
+	}
+
+	ctx := r.ctx
+	if r.tr.Timeout > 0 {
+		var stop context.CancelFunc
+		ctx, stop = context.WithTimeoutCause(ctx, r.tr.Timeout, ErrTimeout)
+		defer stop()
+	}
+	stopWatch := context.AfterFunc(ctx, func() {
+		if cause := context.Cause(ctx); isCause(cause) {
+			s.mu.Lock()
+			if r.phase == running {
+				s.to(r, cancelling)
+			}
+			s.mu.Unlock()
+			s.settle(r, outcomeOf(cause, true))
+		}
+	})
+	o := r.tr.Run(ctx)
+	stopWatch()
+	if cause := context.Cause(ctx); isCause(cause) {
+		o = outcomeOf(cause, true) // a run that ignored its cancellation does not get to report success
+	}
+	o.Started = true
+	s.settle(r, o)
+}
+
+// acquire moves r from ready to running, taking a concurrency slot first. A run that has to wait for a slot is
+// discarded by Close like a queued one. It reports false when r was cancelled before it could run.
+func (s *Scheduler) acquire(r *run) bool {
+	if s.sem != nil {
+		select {
+		case s.sem <- struct{}{}:
+		default:
+			if !s.wait(r) {
+				return false
+			}
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r.ctx.Err() != nil {
+		if s.sem != nil {
+			<-s.sem
+		}
+		return false
+	}
+	s.to(r, running)
+	return true
+}
+
+// wait blocks until r gets a concurrency slot. It reports false when r was cancelled meanwhile.
+func (s *Scheduler) wait(r *run) bool {
+	s.mu.Lock()
+	s.to(r, waiting)
+	if s.closing {
+		r.cancel(ErrShutdown)
+	}
+	s.mu.Unlock()
+	select {
+	case s.sem <- struct{}{}:
+		return true
+	case <-r.ctx.Done():
+		return false
+	}
+}
+
+func isCause(err error) bool {
+	for _, c := range []error{ErrKilled, ErrCovered, ErrHandlerChanged, ErrTimeout, ErrShutdown} {
+		if errors.Is(err, c) {
+			return true
+		}
+	}
+	return false
+}
+
+// outcomeOf is the outcome of a run cancelled with cause.
+func outcomeOf(cause error, started bool) Outcome {
+	code := CodeFail
+	if errors.Is(cause, ErrTimeout) {
+		code = CodeTimeout
+	}
+	return Outcome{Code: code, Msg: cause.Error(), Started: started}
+}

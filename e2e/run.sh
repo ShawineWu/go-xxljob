@@ -3,7 +3,7 @@
 # run the e2e tests -> remove the containers.
 #
 #   make e2e                         # default version 2.4.1 (or ./e2e/run.sh)
-#   XXL_JOB_VERSION=3.5.0 make e2e   # pick a version: 2.4.1 / 3.4.2 / 3.5.0
+#   XXL_JOB_VERSION=3.5.0 make e2e   # pick a version: 2.4.1 / 3.3.1 / 3.4.2 / 3.5.0
 #   make e2e-all                     # run every version in turn
 #   KEEP=1 make e2e                  # keep the containers afterwards to inspect them in the admin UI (admin / 123456)
 #   XXLJOB_E2E_VERBOSE=1 make e2e    # print every executor log line (warnings and errors are always printed)
@@ -15,14 +15,18 @@ cd "$(dirname "$0")"
 
 export XXL_JOB_VERSION="${XXL_JOB_VERSION:-2.4.1}"
 
-# Per-version differences: schema SQL checksum, the admin's context path (root since 3.4.1), and the global accessToken
-# (configured per executor since 3.5).
+# Per-version differences: schema SQL checksum, the admin's context path (root since 3.4.1), the admin's arguments and
+# TOKEN, the executor's AccessToken. Before 3.5 the token is the admin's global xxl.job.accessToken (the image defaults
+# it to default_token, so it is always set explicitly); since 3.5 it is stored on the executor record. 3.3.1 runs with
+# no token at all: it is the version that rejects requests lacking the token header.
 case "$XXL_JOB_VERSION" in
-  2.4.1) SQL_SHA256=f495e8a258111af4f79befad3c70256d656952cf56e64bd5db69494bf1fdcf36 CONTEXT_PATH=/xxl-job-admin GLOBAL_TOKEN=1 ;;
-  3.4.2) SQL_SHA256=6fb3b764bd63a66e63f23c4cb6254a5cb277fa0db23bec14586935699fb60483 CONTEXT_PATH= GLOBAL_TOKEN=1 ;;
-  3.5.0) SQL_SHA256=0ab12dbda74de586dd71a044f52136ae17ebfcde82ee8e5693a689a34f56b600 CONTEXT_PATH= GLOBAL_TOKEN= ;;
-  *) echo "unsupported XXL_JOB_VERSION=$XXL_JOB_VERSION (supported: 2.4.1, 3.4.2, 3.5.0)" >&2; exit 1 ;;
+  2.4.1) SQL_SHA256=f495e8a258111af4f79befad3c70256d656952cf56e64bd5db69494bf1fdcf36 CONTEXT_PATH=/xxl-job-admin TOKEN=e2e-token ADMIN_PARAMS=--xxl.job.accessToken=e2e-token ;;
+  3.3.1) SQL_SHA256=aa08c3fd66e851543378e96f1ca925d71a728af6d5dc5deca44375cca594ba7d CONTEXT_PATH=/xxl-job-admin TOKEN= ADMIN_PARAMS=--xxl.job.accessToken= ;;
+  3.4.2) SQL_SHA256=6fb3b764bd63a66e63f23c4cb6254a5cb277fa0db23bec14586935699fb60483 CONTEXT_PATH= TOKEN=e2e-token ADMIN_PARAMS=--xxl.job.accessToken=e2e-token ;;
+  3.5.0) SQL_SHA256=0ab12dbda74de586dd71a044f52136ae17ebfcde82ee8e5693a689a34f56b600 CONTEXT_PATH= TOKEN=e2e-token ADMIN_PARAMS= ;;
+  *) echo "unsupported XXL_JOB_VERSION=$XXL_JOB_VERSION (supported: 2.4.1, 3.3.1, 3.4.2, 3.5.0)" >&2; exit 1 ;;
 esac
+export XXLJOB_E2E_TOKEN="$TOKEN"
 
 SQL_URL="https://raw.githubusercontent.com/xuxueli/xxl-job/${XXL_JOB_VERSION}/doc/db/tables_xxl_job.sql"
 SQL_FILE=".cache/tables_xxl_job-${XXL_JOB_VERSION}.sql"
@@ -31,7 +35,7 @@ ADMIN_PORT="${XXLJOB_E2E_ADMIN_PORT:-18080}"
 export XXLJOB_E2E_ADMIN_PORT="$ADMIN_PORT"
 export XXLJOB_E2E_ADMIN="http://127.0.0.1:${ADMIN_PORT}${CONTEXT_PATH}"
 export XXLJOB_E2E_VERSION="$XXL_JOB_VERSION"
-export XXLJOB_E2E_ADMIN_PARAMS="${GLOBAL_TOKEN:+--xxl.job.accessToken=e2e-token}"
+export XXLJOB_E2E_ADMIN_PARAMS="$ADMIN_PARAMS"
 
 sha256() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi

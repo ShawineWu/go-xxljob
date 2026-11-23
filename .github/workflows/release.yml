@@ -1,8 +1,11 @@
 name: Release
 
+# Runs when a release tag is pushed: vX.Y.Z for the executor, otelxxljob/vX.Y.Z for the OpenTelemetry module. Tags are
+# immutable once pushed (and the Go proxy caches them), so this workflow does not gate a release: make sure CI is green
+# on the tagged commit before tagging. It records the release on GitHub.
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "otelxxljob/v*"]
 
 permissions:
   contents: read
@@ -17,8 +20,8 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: stable
-      - name: Test
-        run: go test -race -count=1 ./...
+      - name: Test every module
+        run: make test
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

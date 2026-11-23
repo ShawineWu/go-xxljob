@@ -36,20 +36,28 @@ make e2e-all  # all supported admin versions
 
 ## Repository layout
 
-The repository holds two Go modules: the executor at the root and the OpenTelemetry integration in
-[`otelxxljob/`](otelxxljob). `otelxxljob/go.mod` uses a `replace` directive to build against the executor in this
-repository, so changes to both can land in one pull request. The Makefile targets run on every module.
+Read [ARCHITECTURE.md](ARCHITECTURE.md) first: every invariant of the executor has one owner, and a change should
+keep it there rather than spread it.
+
+The repository holds two Go modules: the executor at the root (with its internal packages) and the OpenTelemetry
+integration in [`otelxxljob/`](otelxxljob). `otelxxljob/go.mod` uses a `replace` directive to build against the
+executor in this repository, so changes to both can land in one pull request. `make test`, `lint`, `fmt`, `tidy` and
+`vuln` run on every module; `cover`, `stress`, `bench`, `fuzz` and the e2e targets cover the executor.
 
 ## Releasing (maintainers)
 
 Both modules are released together with the same version (`vX.Y.Z` for the executor, `otelxxljob/vX.Y.Z` for the
 integration):
 
-1. Move the `Unreleased` entries in `CHANGELOG.md` under the new version, and make sure CI on `main` is green.
-2. Tag the executor and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`. The release workflow runs the tests
-   and creates the GitHub release.
+1. Move the `Unreleased` entries in `CHANGELOG.md` under the new version, and make sure CI on `main` is green, end to
+   end tests included. Tags cannot be moved or deleted once pushed (the Go proxy caches them, and a ruleset protects
+   them), so nothing after this step can stop a broken release.
+2. Tag the executor and push the tag: `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`. The release workflow
+   records the GitHub release.
 3. In `otelxxljob/`, require the new executor version (`go get github.com/ShawineWu/go-xxljob@vX.Y.Z`, keeping the
-   `replace`), commit, then tag and push `otelxxljob/vX.Y.Z`.
+   `replace`), and check that it builds against the released executor rather than the repository's:
+   `go mod edit -dropreplace github.com/ShawineWu/go-xxljob && go test ./... && git checkout go.mod go.sum`. Commit,
+   wait for CI, then tag and push `otelxxljob/vX.Y.Z`.
 
 ## Reporting security issues
 

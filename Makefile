@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := check
 
 GO       ?= go
-VERSIONS ?= 2.4.1 3.4.2 3.5.0
+VERSIONS ?= 2.4.1 3.3.1 3.4.2 3.5.0
 # Go modules in this repository: the executor and the OpenTelemetry integration.
 MODULES  := . otelxxljob
 
@@ -46,10 +46,10 @@ tidy: ## Run go mod tidy in every module
 
 .PHONY: vuln
 vuln: ## Scan dependencies for known vulnerabilities
-	@set -e; for m in $(MODULES); do (cd $$m && $(GO) run golang.org/x/vuln/cmd/govulncheck@latest ./...); done
+	@set -e; for m in $(MODULES); do (cd $$m && $(GO) run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...); done
 
 .PHONY: e2e
-e2e: ## Run end-to-end tests against a real xxl-job-admin (docker); XXL_JOB_VERSION=2.4.1|3.4.2|3.5.0
+e2e: ## Run end-to-end tests against a real xxl-job-admin (docker); XXL_JOB_VERSION=2.4.1|3.3.1|3.4.2|3.5.0
 	./e2e/run.sh
 
 .PHONY: e2e-all

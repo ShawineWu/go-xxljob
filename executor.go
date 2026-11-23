@@ -1,87 +1,54 @@
-// Package xxljob is an XXL-JOB executor for Go.
-//
-// It implements the executor side of XXL-JOB (https://github.com/xuxueli/xxl-job): it registers with the admin,
-// runs triggered jobs, reports results, serves execution logs and shuts down gracefully. It supports admin
-// 2.3.0 ~ 3.5.x and depends only on the standard library.
-//
-// Basic usage:
-//
-//	exec, err := xxljob.New(xxljob.Config{
-//		AdminAddresses: []string{"http://xxl-job-admin:8080/xxl-job-admin"},
-//		AccessToken:    "default_token",
-//		AppName:        "demo-executor",
-//	})
-//	if err != nil { ... }
-//	exec.MustRegister("DemoJobHandler", xxljob.HandlerFunc(func(ctx context.Context, req *xxljob.Request) error {
-//		xxljob.Logger(ctx).Info("hello", "params", req.Params)
-//		return nil
-//	}))
-//	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-//	defer stop()
-//	if err := exec.Run(ctx); err != nil { ... } // start, then shut down gracefully when ctx ends
-//
-// See the README for the execution model, block strategies, callbacks and shutdown.
 package xxljob
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
+	"math"
 	"net/http"
-	"strconv"
-	"sync"
+	"slices"
 	"sync/atomic"
 	"time"
+
+	"github.com/ShawineWu/go-xxljob/internal/ratelog"
+	"github.com/ShawineWu/go-xxljob/internal/report"
+	"github.com/ShawineWu/go-xxljob/internal/sched"
+	"github.com/ShawineWu/go-xxljob/internal/wire"
 )
 
-type state int
-
-const (
-	stateNew state = iota
-	stateRunning
-	stateClosing
-)
+// maxClockSkew bounds how far a trigger's log time may be from the executor's clock. It keeps log directories
+// (named after that time) within reach of the retention cleanup.
+const maxClockSkew = 7 * 24 * time.Hour
 
 // Executor is an XXL-JOB executor. All methods are safe for concurrent use.
+//
+// It composes independent parts: the handlers (handlers.go), the scheduler of job threads (internal/sched), the run
+// of one trigger (run.go), the admin client with its callbacks and registry heartbeat (internal/report), the wire
+// protocol (internal/wire), the execution log store, and the HTTP endpoints (server.go). The Executor itself only
+// wires them together; its state and shutdown budget belong to its lifecycle (lifecycle.go).
 type Executor struct {
-	cfg   Config
-	proto protocol // admin protocol, selected by Config.AdminVersion
-	opts  options
-	log   *slog.Logger
-	admin *adminClient
-	cb    *callbacker
-	logs  LogStore
+	cfg      Config
+	opts     options
+	log      *slog.Logger
+	proto    wire.Protocol
+	handlers *handlerSet
+	sched    *sched.Scheduler
+	runner   runner
+	logs     LogStore
 
-	// root is the parent context of every run; Shutdown cancels it with ErrShutdown when its deadline passes.
-	root       context.Context
-	cancelRoot context.CancelCauseFunc
+	callbacks *report.Callbacks
+	registry  *report.Registry
+	server    *http.Server
+	rejectLog *ratelog.Limiter
 
-	mu          sync.Mutex
-	state       state
-	handlers    map[string]registered
-	middlewares []Middleware
-	threads     map[int64]*jobThread // jobId → job thread (exists while the job has a running or queued trigger)
-	wg          sync.WaitGroup       // job threads
-	sem         chan struct{}        // global concurrency limit (when MaxConcurrency > 0)
+	rejected atomic.Int64 // triggers refused before reaching the scheduler
 
-	counters   counters
-	registered atomic.Bool // the last registry heartbeat succeeded
-
-	server       *http.Server
-	stopRegistry chan struct{}
-	registryDone chan struct{}
-	shutdownOnce sync.Once
-	shutdownErr  error
+	life lifecycle
 }
 
-type registered struct {
-	h   Handler
-	mws []Middleware
-}
-
-// New validates the configuration and creates an executor. It neither listens nor registers; see Start.
+// New validates the configuration and creates an executor. It neither listens nor registers; see Start and Run.
 func New(c Config, opts ...Option) (*Executor, error) {
 	cfg, err := c.normalize()
 	if err != nil {
@@ -91,58 +58,55 @@ func New(c Config, opts ...Option) (*Executor, error) {
 	for _, opt := range opts {
 		opt(&o)
 	}
-	if o.logger == nil {
-		o.logger = slog.Default()
-	}
+	o.logger = cmp.Or(o.logger, slog.Default())
 	if o.logStore == nil {
 		o.logStore = NewMemoryLogStore(0)
 	}
-	proto, err := newProtocol(cfg)
+	proto, err := wire.New(cfg.AdminVersion, cfg.AccessToken, cfg.AppName)
+	if err != nil {
+		return nil, fmt.Errorf("xxljob: %w", err)
+	}
+	handlers, err := newHandlerSet(o.middlewares)
 	if err != nil {
 		return nil, err
 	}
-	admin := newAdminClient(cfg, proto, o.httpClient)
-	root, cancel := context.WithCancelCause(context.Background())
-	var sem chan struct{}
-	if cfg.MaxConcurrency > 0 {
-		sem = make(chan struct{}, cfg.MaxConcurrency)
+	client := report.NewClient(cfg.AdminAddresses, proto, o.httpClient, cfg.RequestTimeout)
+	callbacks, err := report.NewCallbacks(client, o.logger, report.CallbackConfig{
+		RetryInterval: cfg.CallbackRetryInterval, MaxPending: cfg.MaxPendingCallbacks, MaxBytes: maxMessageBytes,
+		Dir: cfg.CallbackDir,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("xxljob: %w", err)
 	}
-	return &Executor{
-		cfg:         cfg,
-		proto:       proto,
-		opts:        o,
-		log:         o.logger,
-		admin:       admin,
-		cb:          newCallbacker(admin, o.logger, cfg),
-		logs:        o.logStore,
-		root:        root,
-		cancelRoot:  cancel,
-		handlers:    map[string]registered{},
-		middlewares: o.middlewares,
-		threads:     map[int64]*jobThread{},
-		sem:         sem,
-	}, nil
+	e := &Executor{
+		cfg:       cfg,
+		opts:      o,
+		log:       o.logger,
+		proto:     proto,
+		handlers:  handlers,
+		runner:    runner{store: o.logStore, app: o.logger, longRunning: cfg.LongRunningThreshold},
+		logs:      o.logStore,
+		callbacks: callbacks,
+		registry:  report.NewRegistry(client, o.logger, cfg.AppName, cfg.Address, cfg.RegistryInterval),
+		rejectLog: ratelog.New(time.Minute),
+		life:      newLifecycle(),
+	}
+	e.sched = sched.New(sched.Config{MaxQueue: cfg.MaxQueueSize, MaxActive: cfg.MaxActiveTriggers,
+		MaxConcurrency: cfg.MaxConcurrency}, e.report)
+	return e, nil
 }
 
 // Config returns the effective configuration, including defaults and the derived Address.
-func (e *Executor) Config() Config { return e.cfg }
+func (e *Executor) Config() Config {
+	c := e.cfg
+	c.AdminAddresses = slices.Clone(c.AdminAddresses)
+	return c
+}
 
-// Register registers a JobHandler. mws apply to this handler only, inside the global middlewares.
-// It returns an error for an empty or duplicate name.
+// Register registers a JobHandler. mws apply to this handler only, inside the global middlewares. It returns an
+// error for an empty or duplicate name, or a nil handler or middleware.
 func (e *Executor) Register(name string, h Handler, mws ...Middleware) error {
-	if name == "" {
-		return errors.New("xxljob: empty handler name")
-	}
-	if h == nil {
-		return fmt.Errorf("xxljob: nil handler %q", name)
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if _, dup := e.handlers[name]; dup {
-		return fmt.Errorf("xxljob: duplicate handler %q", name)
-	}
-	e.handlers[name] = registered{h: h, mws: mws}
-	return nil
+	return e.handlers.add(map[string]registered{name: {h: h, mws: slices.Clone(mws)}})
 }
 
 // MustRegister is like Register but panics on error.
@@ -152,32 +116,21 @@ func (e *Executor) MustRegister(name string, h Handler, mws ...Middleware) {
 	}
 }
 
-// RegisterTasks registers tasks by Task.Name. If any task is nil or has an empty or duplicate name, it returns an
-// error and registers none of them.
+// RegisterTasks registers tasks by Task.Name. If any task is nil or has an empty or duplicate name, it registers
+// none of them.
 func (e *Executor) RegisterTasks(tasks ...Task) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	seen := make(map[string]bool, len(tasks))
+	entries := make(map[string]registered, len(tasks))
 	for _, t := range tasks {
 		if t == nil {
 			return errors.New("xxljob: nil task")
 		}
 		name := t.Name()
-		switch {
-		case name == "":
-			return fmt.Errorf("xxljob: task %T has an empty name", t)
-		case seen[name]:
+		if _, dup := entries[name]; dup {
 			return fmt.Errorf("xxljob: duplicate handler %q (task %T)", name, t)
 		}
-		if _, dup := e.handlers[name]; dup {
-			return fmt.Errorf("xxljob: duplicate handler %q (task %T)", name, t)
-		}
-		seen[name] = true
+		entries[name] = registered{h: t}
 	}
-	for _, t := range tasks {
-		e.handlers[t.Name()] = registered{h: t}
-	}
-	return nil
+	return e.handlers.add(entries)
 }
 
 // MustRegisterTasks is like RegisterTasks but panics on error.
@@ -187,219 +140,115 @@ func (e *Executor) MustRegisterTasks(tasks ...Task) {
 	}
 }
 
-// Use appends global middlewares; they apply to runs that start afterwards.
+// Use appends global middlewares. They apply to triggers accepted afterwards. It panics on a nil middleware, like
+// http.Handle does on a nil handler.
 func (e *Executor) Use(mws ...Middleware) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.middlewares = append(e.middlewares, mws...)
+	if err := e.handlers.use(mws); err != nil {
+		panic(err)
+	}
 }
 
-// Start listens on the executor port (unless WithoutServer is set), then starts the registry heartbeat and the
-// result callbacks. It does not block. It listens before registering, so a port that is already taken fails Start
-// instead of registering an executor that cannot receive triggers. Start can be called only once.
-func (e *Executor) Start() error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.state != stateNew {
-		return errors.New("xxljob: executor already started or shut down")
-	}
-	if !e.opts.withoutServer {
-		ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", ":"+strconv.Itoa(e.cfg.Port))
-		if err != nil {
-			return fmt.Errorf("xxljob: listen executor port %d: %w", e.cfg.Port, err)
-		}
-		e.server = &http.Server{
-			Handler:           e.Handler(),
-			ReadHeaderTimeout: 5 * time.Second,
-			ReadTimeout:       10 * time.Second,
-			WriteTimeout:      10 * time.Second,
-			IdleTimeout:       time.Minute,
-		}
-		go func() {
-			if err := e.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				e.log.Error("xxljob: executor server stopped unexpectedly", "err", err)
-			}
-		}()
-	}
-	e.state = stateRunning
-	e.cb.start()
-	e.stopRegistry = make(chan struct{})
-	e.registryDone = make(chan struct{})
-	go e.registryLoop()
-
-	if e.cfg.AccessToken == "" {
-		e.log.Warn("xxljob: AccessToken is empty, requests to the executor are not authenticated")
-	}
-	e.log.Info("xxljob: executor started", "app_name", e.cfg.AppName, "address", e.cfg.Address, "handlers", len(e.handlers))
-	return nil
-}
-
-// Run starts the executor, blocks until ctx is done, then shuts it down gracefully, giving running jobs
-// Config.ShutdownTimeout to finish. It is the usual way to run an executor from main:
-//
-//	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-//	defer stop()
-//	if err := exec.Run(ctx); err != nil { ... }
-//
-// It returns Start's error if the executor cannot start, and Shutdown's error (context.DeadlineExceeded) if running
-// jobs had to be cancelled; the end of ctx itself is a normal stop and returns nil.
-func (e *Executor) Run(ctx context.Context) error {
-	if err := e.Start(); err != nil {
-		return err
-	}
-	<-ctx.Done()
-	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), e.cfg.ShutdownTimeout)
-	defer cancel()
-	return e.Shutdown(sctx)
-}
-
-// Shutdown stops the executor gracefully:
-//
-//  1. reject new triggers (run, beat and idleBeat fail, so failover routing sends work to other instances);
-//  2. stop the registry heartbeat and deregister; report queued triggers as failed;
-//  3. wait for running jobs until ctx is done; then cancel them with ErrShutdown and wait Config.CancelWait more;
-//  4. deliver the remaining results; close the executor port (last, so the admin can still kill jobs while
-//     waiting); close the log store.
-//
-// It returns ctx's error if running jobs had to be cancelled. It may be called more than once; concurrent calls
-// wait for the first one to finish.
-func (e *Executor) Shutdown(ctx context.Context) error {
-	e.shutdownOnce.Do(func() { e.shutdownErr = e.shutdown(ctx) })
-	return e.shutdownErr
-}
-
-func (e *Executor) shutdown(ctx context.Context) error {
-	e.mu.Lock()
-	started := e.state == stateRunning
-	e.state = stateClosing
-	var dropped []*trigger
-	for _, t := range e.threads {
-		dropped = append(dropped, t.drain()...)
-	}
-	e.mu.Unlock()
-
-	for _, tr := range dropped {
-		e.discard(tr, ErrShutdown)
-	}
-	if started {
-		close(e.stopRegistry)
-		<-e.registryDone
-		e.deregister(context.Background())
-	}
-
-	var err error
-	if !waitGroup(ctx, &e.wg) {
-		err = ctx.Err()
-		e.log.Warn("xxljob: jobs still running at shutdown deadline, cancelling them")
-		e.cancelRoot(ErrShutdown)
-		cctx, cancel := context.WithTimeout(context.Background(), e.cfg.CancelWait)
-		if !waitGroup(cctx, &e.wg) {
-			e.log.Error("xxljob: jobs did not return after cancellation", "wait", e.cfg.CancelWait.String())
-		}
-		cancel()
-	}
-
-	if started {
-		fctx, cancel := ctx, context.CancelFunc(func() {})
-		if ctx.Err() != nil {
-			fctx, cancel = context.WithTimeout(context.Background(), e.cfg.CancelWait)
-		}
-		e.cb.close(fctx)
-		cancel()
-	}
-	if e.server != nil {
-		sctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		_ = e.server.Shutdown(sctx)
-		cancel()
-	}
-	if cerr := e.logs.Close(); cerr != nil {
-		e.log.Error("xxljob: close log store", "err", cerr)
-	}
-	e.log.Info("xxljob: executor stopped", "app_name", e.cfg.AppName)
-	return err
-}
-
-// Stats is a snapshot of the executor's activity, for metrics and health checks.
+// Stats is a snapshot of the executor's activity, for metrics and alerts.
 //
 // Running, Queued and PendingCallbacks are current values (gauges). Accepted through TimedOut are totals since the
-// executor was created (counters). Every accepted trigger ends up in exactly one of Succeeded, Failed or TimedOut,
-// so Accepted - Succeeded - Failed - TimedOut is the number of triggers still in flight.
+// executor was created (counters); every accepted trigger ends up in exactly one of Succeeded, Failed and TimedOut,
+// so Accepted - Succeeded - Failed - TimedOut is the number of triggers in flight.
 type Stats struct {
-	// Running is the number of running triggers, including those waiting for a concurrency slot and those killed
-	// but not yet returned.
+	// Running is the number of jobs with a running trigger, including triggers waiting for a concurrency slot and
+	// cancelled runs whose handler has not returned yet.
 	Running int
 	// Queued is the number of queued triggers (SERIAL_EXECUTION).
 	Queued int
-	// PendingCallbacks is the number of results waiting to be reported, including retries.
+	// PendingCallbacks is the number of results not yet delivered to the admin, including the batch being sent.
+	// A steady rise means the admin is unreachable.
 	PendingCallbacks int
-	// Registered reports whether the last registry heartbeat succeeded. It is false before the first heartbeat,
-	// while the admin is unreachable, and after Shutdown; use it for readiness checks.
+	// Registered reports whether the last registry heartbeat succeeded. It follows the admin's availability, so
+	// alert on it rather than using it as a readiness probe: an admin outage would take every instance out of
+	// service.
 	Registered bool
 
 	// Accepted counts triggers the executor accepted.
 	Accepted int64
-	// Rejected counts triggers the executor refused: unknown handler, DISCARD_LATER while busy, full queue,
-	// repeated log_id, unsupported glue type, not started or shutting down.
+	// Rejected counts triggers it refused: unknown handler, DISCARD_LATER while busy, full queue, repeated log_id,
+	// unsupported glue type, invalid parameters, not started or shutting down.
 	Rejected int64
-	// Succeeded counts runs reported as successful (200).
-	Succeeded int64
-	// Failed counts runs reported as failed (500): errors, panics, kills, covered or discarded triggers, shutdown.
-	Failed int64
-	// TimedOut counts runs reported as timed out (502).
-	TimedOut int64
+	// Succeeded, Failed and TimedOut count the outcomes of accepted triggers (codes 200, 500 and 502): failures
+	// include errors, panics, kills, covered or discarded triggers and shutdown.
+	Succeeded, Failed, TimedOut int64
 }
 
-// counters are the cumulative counts reported by Stats.
-type counters struct {
-	accepted, rejected, succeeded, failed, timedOut atomic.Int64
-}
-
-// Stats returns a snapshot of the executor's activity, e.g. for metrics and readiness checks.
+// Stats returns a snapshot of the executor's activity.
 func (e *Executor) Stats() Stats {
-	st := Stats{
-		Registered: e.registered.Load(),
-		Accepted:   e.counters.accepted.Load(),
-		Rejected:   e.counters.rejected.Load(),
-		Succeeded:  e.counters.succeeded.Load(),
-		Failed:     e.counters.failed.Load(),
-		TimedOut:   e.counters.timedOut.Load(),
+	st := e.sched.Stats()
+	return Stats{
+		Running: st.Running, Queued: st.Queued,
+		PendingCallbacks: e.callbacks.Pending(),
+		Registered:       e.registry.Registered(),
+		Accepted:         st.Accepted, Rejected: st.Rejected + e.rejected.Load(),
+		Succeeded: st.Succeeded, Failed: st.Failed, TimedOut: st.TimedOut,
 	}
-	e.mu.Lock()
-	for _, t := range e.threads {
-		if t.running != nil {
-			st.Running++
+}
+
+// ---------------------------------------------------------------------------------------------
+// Triggers
+// ---------------------------------------------------------------------------------------------
+
+// trigger validates a run request from the admin and hands it to the scheduler.
+func (e *Executor) trigger(in wire.TriggerRequest) wire.Reply {
+	req, err := e.validate(in)
+	if err == nil {
+		var h Handler
+		if h, err = e.handlers.resolve(in.ExecutorHandler); err == nil {
+			err = e.sched.Submit(&sched.Trigger{
+				JobID: in.JobID, LogID: in.LogID, LogTime: in.LogDateTime, Handler: in.ExecutorHandler,
+				Strategy: in.ExecutorBlockStrategy, Timeout: req.Timeout,
+				Run: func(ctx context.Context) sched.Outcome {
+					code, msg, _ := e.runner.run(ctx, h, req, LogRef{LogID: req.LogID, LogTime: req.LogTime})
+					return sched.Outcome{Code: code, Msg: msg}
+				},
+			})
+			if err == nil {
+				return wire.OK()
+			}
+			return wire.Fail("%s", err) // counted by the scheduler
 		}
-		st.Queued += len(t.queue)
 	}
-	e.mu.Unlock()
-	st.PendingCallbacks = e.cb.pendingCount()
-	return st
+	e.rejected.Add(1)
+	return wire.Fail("%s", err)
 }
 
-// report counts a result and queues it for the admin.
-func (e *Executor) report(res result) {
-	switch res.Code {
-	case codeSuccess:
-		e.counters.succeeded.Add(1)
-	case codeTimeout:
-		e.counters.timedOut.Add(1)
-	default:
-		e.counters.failed.Add(1)
+// validate checks what the scheduler cannot: the executor's state, the glue type and the values sent by the admin.
+func (e *Executor) validate(in wire.TriggerRequest) (Request, error) {
+	switch e.life.current() {
+	case stateNew:
+		return Request{}, errors.New("executor is not started")
+	case stateClosing:
+		return Request{}, ErrShutdown
 	}
-	e.cb.push(res)
+	switch {
+	case in.GlueType != "" && in.GlueType != wire.GlueBean:
+		return Request{}, fmt.Errorf("glue type [%s] is not supported, only BEAN", in.GlueType)
+	case in.JobID <= 0 || in.LogID <= 0:
+		return Request{}, fmt.Errorf("invalid trigger: jobId %d, logId %d", in.JobID, in.LogID)
+	case in.ExecutorTimeout < 0 || in.ExecutorTimeout > math.MaxInt64/int64(time.Second):
+		return Request{}, fmt.Errorf("invalid executorTimeout %d", in.ExecutorTimeout)
+	}
+	logTime := time.UnixMilli(in.LogDateTime)
+	if d := time.Since(logTime); d > maxClockSkew || d < -maxClockSkew {
+		return Request{}, fmt.Errorf("invalid logDateTime %d: more than %v away from the executor's clock", in.LogDateTime, maxClockSkew)
+	}
+	timeout := time.Duration(in.ExecutorTimeout) * time.Second
+	if timeout == 0 {
+		timeout = e.cfg.DefaultTimeout
+	}
+	return Request{
+		JobID: in.JobID, LogID: in.LogID, LogTime: logTime, Handler: in.ExecutorHandler, Params: in.ExecutorParams,
+		BlockStrategy: in.ExecutorBlockStrategy, Timeout: timeout, ShardIndex: in.BroadcastIndex,
+		ShardTotal: max(in.BroadcastTotal, 1),
+	}, nil
 }
 
-// waitGroup waits for wg or ctx and reports whether wg finished.
-func waitGroup(ctx context.Context, wg *sync.WaitGroup) bool {
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		return true
-	case <-ctx.Done():
-		return false
-	}
+// report delivers a trigger's outcome to the admin. It is the scheduler's Reporter.
+func (e *Executor) report(tr *sched.Trigger, o sched.Outcome) {
+	e.callbacks.Push(wire.Result{LogID: tr.LogID, LogTime: tr.LogTime, Code: o.Code, Msg: wire.TruncateMsg(o.Msg)})
 }

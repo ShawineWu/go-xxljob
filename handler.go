@@ -3,27 +3,49 @@ package xxljob
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/ShawineWu/go-xxljob/internal/sched"
+	"github.com/ShawineWu/go-xxljob/internal/wire"
 )
 
-// Reasons a run's context is cancelled. Check them with context.Cause(ctx).
+// Causes a run's context is cancelled with; check them with context.Cause(ctx). The run is reported to the admin as
+// failed (timed out for ErrTimeout) the moment its context is cancelled, whatever the handler returns afterwards.
 var (
 	// ErrKilled means the admin killed the job.
-	ErrKilled = errors.New("xxljob: job killed by the scheduling center")
+	ErrKilled = sched.ErrKilled
 	// ErrCovered means a newer trigger replaced this run (block strategy COVER_EARLY).
-	ErrCovered = errors.New("xxljob: job covered by a newer trigger")
+	ErrCovered = sched.ErrCovered
 	// ErrHandlerChanged means the job was switched to another JobHandler in the admin.
-	ErrHandlerChanged = errors.New("xxljob: job handler changed")
+	ErrHandlerChanged = sched.ErrHandlerChanged
 	// ErrTimeout means the run exceeded its timeout.
-	ErrTimeout = errors.New("xxljob: job execution timeout")
+	ErrTimeout = sched.ErrTimeout
 	// ErrShutdown means the executor is shutting down and stopped waiting for the run.
-	ErrShutdown = errors.New("xxljob: executor is shutting down")
+	ErrShutdown = sched.ErrShutdown
 )
 
-// Request is one trigger of a job.
+// Block strategies: what happens to a trigger that arrives while the previous run of the same job is still going.
+// They are the values of Request.BlockStrategy.
+const (
+	// BlockSerial queues the trigger and runs it after the previous one (the default).
+	BlockSerial = sched.Serial
+	// BlockDiscardLater rejects the new trigger.
+	BlockDiscardLater = sched.DiscardLater
+	// BlockCoverEarly cancels the running trigger, discards queued ones, and runs the new one once the cancelled run
+	// has returned.
+	BlockCoverEarly = sched.CoverEarly
+)
+
+// Result codes reported to the admin.
+const (
+	CodeSuccess = wire.CodeSuccess
+	CodeFailure = wire.CodeFail
+	CodeTimeout = wire.CodeTimeout
+)
+
+// Request is one trigger of a job. Handlers receive their own copy: changing it affects nothing else.
 type Request struct {
 	JobID int64
 	LogID int64
@@ -44,12 +66,13 @@ type Request struct {
 }
 
 // BindJSON decodes Params into v. When Params is blank it does nothing, so v keeps the defaults set by the caller.
+// The error does not include the parameters, which may hold secrets.
 func (r *Request) BindJSON(v any) error {
 	if strings.TrimSpace(r.Params) == "" {
 		return nil
 	}
 	if err := json.Unmarshal([]byte(r.Params), v); err != nil {
-		return fmt.Errorf("xxljob: invalid job params %q: %w", r.Params, err)
+		return fmt.Errorf("xxljob: invalid job params (%d bytes): %w", len(r.Params), err)
 	}
 	return nil
 }
@@ -58,8 +81,9 @@ func (r *Request) BindJSON(v any) error {
 //
 // Returning an error fails the run: the admin shows it as failed and applies its alarm and retry settings. A panic
 // is reported as a failure too. Returning nil succeeds; use SetResult to attach a message. The context is cancelled
-// on timeout, kill, COVER_EARLY and executor shutdown (see context.Cause). Long-running handlers must watch it:
-// until a handler returns, later triggers of the same job are only queued or discarded.
+// on timeout, kill, COVER_EARLY, handler change and executor shutdown (see context.Cause). Long-running handlers must
+// watch it: the run is reported as failed when it is cancelled, but later triggers of the same job wait until the
+// handler returns, so that a job never runs twice at once.
 type Handler interface {
 	Handle(ctx context.Context, req *Request) error
 }
@@ -85,8 +109,8 @@ type Task interface {
 	Name() string
 }
 
-// HandleJSON decodes the job parameters (JSON) into P before calling fn, saving a BindJSON call in every handler.
-// Blank parameters leave p as the zero value; invalid JSON fails the run without calling fn.
+// HandleJSON decodes the job parameters (JSON) into P before calling fn. Blank parameters leave the value at its
+// zero value; invalid JSON fails the run without calling fn.
 //
 //	exec.MustRegister("Cleanup", xxljob.HandleJSON(func(ctx context.Context, req *xxljob.Request, p struct{ Days int }) error { ... }))
 func HandleJSON[P any](fn func(ctx context.Context, req *Request, params P) error) Handler {
@@ -99,13 +123,7 @@ func HandleJSON[P any](fn func(ctx context.Context, req *Request, params P) erro
 	})
 }
 
-// Middleware wraps a Handler, e.g. for logging, tracing, metrics or rate limiting.
+// Middleware wraps a Handler, e.g. for logging, tracing, metrics or rate limiting. The chain is built when a trigger
+// is accepted, outside the executor's locks: a middleware may call the Executor (Stats, ...). A middleware that
+// panics while building fails that trigger.
 type Middleware func(next Handler) Handler
-
-// chain wraps h with mws, outermost first: chain(h, a, b) calls a, then b, then h.
-func chain(h Handler, mws ...Middleware) Handler {
-	for i := len(mws) - 1; i >= 0; i-- {
-		h = mws[i](h)
-	}
-	return h
-}
