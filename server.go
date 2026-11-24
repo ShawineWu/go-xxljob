@@ -18,11 +18,18 @@ const (
 	maxHeaderBytes  = 64 << 10
 )
 
-// Handler returns the HTTP handler of the executor port: the run path (/run, or /trigger for admin 3.5+), /kill,
+// maxLogReads bounds the /log requests served at once: a read holds a run's whole log (up to its cap) in memory a
+// few times over. Further requests wait for a turn.
+const maxLogReads = 4
+
+// HTTPHandler returns the HTTP handler of the executor port: the run path (/run, or /trigger for admin 3.5+), /kill,
 // /beat, /idleBeat and /log. The executor serves it on Config.Port; with WithoutServer, mount it on your own server
 // (use http.StripPrefix for a sub-path) before calling Start. Like the official executor it always answers with
-// HTTP 200 and a JSON body whose code tells success from failure.
-func (e *Executor) Handler() http.Handler {
+// HTTP 200 and a JSON body whose code tells success from failure. Every call returns the same handler.
+func (e *Executor) HTTPHandler() http.Handler { return e.mux }
+
+// newMux builds the handler returned by HTTPHandler.
+func (e *Executor) newMux() http.Handler {
 	mux := http.NewServeMux()
 	route := func(path string, fn func(body []byte) wire.Reply) {
 		mux.Handle("POST "+path, e.endpoint(fn))
@@ -30,6 +37,7 @@ func (e *Executor) Handler() http.Handler {
 	route(e.proto.RunPath(), func(body []byte) wire.Reply {
 		var req wire.TriggerRequest
 		if err := json.Unmarshal(body, &req); err != nil {
+			e.rejected.Add(1)
 			return wire.Fail("invalid run request: %v", err)
 		}
 		return e.trigger(req)
@@ -93,7 +101,7 @@ func (e *Executor) endpoint(fn func(body []byte) wire.Reply) http.Handler {
 				res = fn(body)
 			}
 		}
-		w.Header().Set("Content-Type", "application/json;charset=UTF-8")
+		w.Header().Set("Content-Type", wire.ContentType)
 		_ = json.NewEncoder(w).Encode(e.proto.EncodeReply(res))
 	})
 }
@@ -109,13 +117,12 @@ func (e *Executor) beat() wire.Reply {
 
 // readLog reads an execution log for the admin's log viewer.
 func (e *Executor) readLog(q wire.LogRequest) wire.Reply {
-	chunk, err := e.logs.Read(LogRef{LogID: q.LogID, LogTime: time.UnixMilli(q.LogTime)}, q.FromLine)
+	e.logReads <- struct{}{}
+	defer func() { <-e.logReads }()
+	chunk, err := e.readStore(LogRef{LogID: q.LogID, LogTime: time.UnixMilli(q.LogTime)}, q.FromLine)
 	if errors.Is(err, ErrLogNotFound) {
-		// The viewer only shows content when toLineNum >= fromLineNum.
-		from := max(q.FromLine, 1)
-		return wire.Reply{Code: CodeSuccess, Payload: wire.LogResult{FromLineNum: from, ToLineNum: from, IsEnd: true,
-			LogContent: fmt.Sprintf("log not found on this executor (log_id=%d): it may have been cleaned up, "+
-				"the run happened on another instance, or the executor restarted", q.LogID)}}
+		return wire.LogNotice(q.FromLine, fmt.Sprintf("log not found on this executor (log_id=%d): it may have been "+
+			"cleaned up, the run happened on another instance, or the executor restarted", q.LogID))
 	}
 	if err != nil {
 		e.log.Error("xxljob: read log", "log_id", q.LogID, "err", err)
@@ -123,4 +130,14 @@ func (e *Executor) readLog(q wire.LogRequest) wire.Reply {
 	}
 	return wire.Reply{Code: CodeSuccess, Payload: wire.LogResult{
 		FromLineNum: chunk.FromLine, ToLineNum: chunk.ToLine, LogContent: chunk.Content, IsEnd: chunk.End}}
+}
+
+// readStore reads from the log store, which may be the application's own, turning a panic into an error.
+func (e *Executor) readStore(ref LogRef, fromLine int) (chunk LogChunk, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("log store Read panicked: %v", p)
+		}
+	}()
+	return e.logs.Read(ref, fromLine)
 }

@@ -19,7 +19,7 @@ var errGoexit = errors.New("xxljob: handler exited its goroutine without returni
 const maxLoggedParams = 1 << 10
 
 // runner executes a handler once: the execution log, the logger in its context, the long-running warning, and the
-// containment of panics and runtime.Goexit. Deciding the reported outcome belongs to sched.Classify. It is shared by
+// containment of panics and runtime.Goexit. Deciding the reported outcome is not its job (see run). It is shared by
 // the executor and Invoke.
 type runner struct {
 	store       LogStore
@@ -27,12 +27,14 @@ type runner struct {
 	longRunning time.Duration
 }
 
-// run executes h for req. It returns what the handler produced, as plain data for the scheduler, and the handler's
-// error itself (for Invoke's callers).
-func (rn runner) run(ctx context.Context, h Handler, req Request, ref LogRef) (sched.Result, error) {
+// run executes h for req. It returns what the handler produced, as plain data for the one decision of the outcome
+// (sched.Classify, made by the scheduler or by Invoke), the handler's error itself (for Invoke's callers), and
+// finish, which must then be called once with that outcome: it writes the last line of the execution log and ends
+// the log, so that the log always states the outcome that was reported, even when a cancellation arrived after the
+// handler returned.
+func (rn runner) run(ctx context.Context, h Handler, req Request, ref LogRef) (sched.Result, func(sched.Outcome), error) {
 	app := rn.app.With("handler", req.Handler, "job_id", req.JobID, "log_id", req.LogID)
 	log := &execLog{store: rn.store, ref: ref, app: app}
-	defer log.end()
 	text := slog.New(slog.NewTextHandler(log, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	rs := &runState{req: &req, logger: slog.New(slog.NewMultiHandler(text.Handler(), app.Handler()))}
 	ctx = withRun(ctx, rs)
@@ -41,12 +43,12 @@ func (rn runner) run(ctx context.Context, h Handler, req Request, ref LogRef) (s
 		"shard", fmt.Sprintf("%d/%d", req.ShardIndex, req.ShardTotal), "block_strategy", req.BlockStrategy,
 		"timeout", req.Timeout.String())
 	start := time.Now()
+	var timer *time.Timer
 	if rn.longRunning > 0 {
-		timer := time.AfterFunc(rn.longRunning, func() {
+		timer = time.AfterFunc(rn.longRunning, func() {
 			app.Warn("xxljob: job is still running", "elapsed", time.Since(start).String(), "threshold", rn.longRunning.String())
 			text.Warn("job is still running", "elapsed", time.Since(start).String())
 		})
-		defer timer.Stop()
 	}
 
 	var res sched.Result
@@ -57,14 +59,19 @@ func (rn runner) run(ctx context.Context, h Handler, req Request, ref LogRef) (s
 	} else {
 		res, err = call(ctx, h, rs, app, text)
 	}
-
-	o := sched.Classify(context.Cause(ctx), res)
-	if o.Status == sched.Succeeded {
-		text.Info("job succeeded", "elapsed", time.Since(start).String(), "result", o.Msg)
-	} else {
-		text.Error("job failed", "code", codeOf(o.Status), "elapsed", time.Since(start).String(), "err", o.Msg)
+	if timer != nil {
+		timer.Stop()
 	}
-	return res, err
+
+	finish := func(o sched.Outcome) {
+		defer log.end()
+		if o.Status == sched.Succeeded {
+			text.Info("job succeeded", "elapsed", time.Since(start).String(), "result", o.Msg)
+		} else {
+			text.Error("job failed", "code", codeOf(o.Status), "elapsed", time.Since(start).String(), "err", o.Msg)
+		}
+	}
+	return res, finish, err
 }
 
 // call runs the handler on its own goroutine and turns what it produced into plain data there, under the same

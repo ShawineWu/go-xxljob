@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -42,6 +43,8 @@ type Executor struct {
 	registry  *report.Registry
 	server    *http.Server
 	rejectLog *ratelog.Limiter
+	mux       http.Handler  // HTTPHandler
+	logReads  chan struct{} // bounds the /log requests served at once
 
 	rejected atomic.Int64 // triggers refused before reaching the scheduler
 
@@ -58,6 +61,10 @@ func New(c Config, opts ...Option) (*Executor, error) {
 	for _, opt := range opts {
 		opt(&o)
 	}
+	if o.withoutServer && strings.TrimSpace(c.Address) == "" {
+		// The address derived from IP and Port would register a port nobody listens on.
+		return nil, errors.New("xxljob: Config.Address is required with WithoutServer: the URL where HTTPHandler is mounted")
+	}
 	o.logger = cmp.Or(o.logger, slog.Default())
 	if o.logStore == nil {
 		o.logStore = NewMemoryLogStore(0)
@@ -65,10 +72,6 @@ func New(c Config, opts ...Option) (*Executor, error) {
 	proto, err := wire.New(cfg.AdminVersion, cfg.AccessToken, cfg.AppName)
 	if err != nil {
 		return nil, fmt.Errorf("xxljob: %w", err)
-	}
-	handlers, err := newHandlerSet(o.middlewares)
-	if err != nil {
-		return nil, err
 	}
 	client := report.NewClient(cfg.AdminAddresses, proto, o.httpClient, cfg.RequestTimeout)
 	callbacks, err := report.NewCallbacks(client, o.logger, report.CallbackConfig{
@@ -83,14 +86,16 @@ func New(c Config, opts ...Option) (*Executor, error) {
 		opts:      o,
 		log:       o.logger,
 		proto:     proto,
-		handlers:  handlers,
+		handlers:  newHandlerSet(),
 		runner:    runner{store: o.logStore, app: o.logger, longRunning: cfg.LongRunningThreshold},
 		logs:      o.logStore,
 		callbacks: callbacks,
 		registry:  report.NewRegistry(client, o.logger, cfg.AppName, cfg.Address, cfg.RegistryInterval),
 		rejectLog: ratelog.New(time.Minute),
+		logReads:  make(chan struct{}, maxLogReads),
 		life:      newLifecycle(),
 	}
+	e.mux = e.newMux()
 	e.sched = sched.New(sched.Config{MaxQueue: cfg.MaxQueueSize, MaxActive: cfg.MaxActiveTriggers,
 		MaxConcurrency: cfg.MaxConcurrency}, e.report)
 	return e, nil
@@ -140,8 +145,9 @@ func (e *Executor) MustRegisterTasks(tasks ...Task) {
 	}
 }
 
-// Use appends global middlewares. They apply to triggers accepted afterwards. It panics on a nil middleware, like
-// http.Handle does on a nil handler.
+// Use appends global middlewares, outermost first. Chains are built when a run starts, so they apply to runs that
+// start afterwards, including triggers already queued. It panics on a nil middleware, like http.Handle does on a nil
+// handler.
 func (e *Executor) Use(mws ...Middleware) {
 	if err := e.handlers.use(mws); err != nil {
 		panic(err)
@@ -200,17 +206,25 @@ func (e *Executor) trigger(in wire.TriggerRequest) wire.Reply {
 		e.rejected.Add(1)
 		return wire.Fail("%s", err)
 	}
+	var finish func(sched.Outcome) // set by Run, called by Done: both run on the trigger's goroutine
 	err = e.sched.Submit(&sched.Trigger{
 		JobID: in.JobID, LogID: in.LogID, LogTime: in.LogDateTime, Handler: in.ExecutorHandler,
-		Strategy: in.ExecutorBlockStrategy, Timeout: req.Timeout,
+		Strategy: req.BlockStrategy, Timeout: req.Timeout,
 		Run: func(ctx context.Context) sched.Result {
 			// The chain is built when the run starts, so a rejected trigger never runs middleware constructors.
 			h, err := e.handlers.resolve(req.Handler)
 			if err != nil {
+				e.log.Error("xxljob: build handler chain", "handler", req.Handler, "log_id", req.LogID, "err", err)
 				return sched.Result{Failed: true, Msg: err.Error()}
 			}
-			res, _ := e.runner.run(ctx, h, req, LogRef{LogID: req.LogID, LogTime: req.LogTime})
+			res, fin, _ := e.runner.run(ctx, h, req, LogRef{LogID: req.LogID, LogTime: req.LogTime})
+			finish = fin
 			return res
+		},
+		Done: func(o sched.Outcome) {
+			if finish != nil {
+				finish(o)
+			}
 		},
 	})
 	if err != nil {
@@ -244,7 +258,7 @@ func (e *Executor) validate(in wire.TriggerRequest) (Request, error) {
 	}
 	return Request{
 		JobID: in.JobID, LogID: in.LogID, LogTime: logTime, Handler: in.ExecutorHandler, Params: in.ExecutorParams,
-		BlockStrategy: in.ExecutorBlockStrategy, Timeout: timeout, ShardIndex: in.BroadcastIndex,
+		BlockStrategy: sched.NormalizeStrategy(in.ExecutorBlockStrategy), Timeout: timeout, ShardIndex: in.BroadcastIndex,
 		ShardTotal: max(in.BroadcastTotal, 1),
 	}, nil
 }

@@ -29,8 +29,17 @@ FUZZTIME ?= 30s
 FUZZ_TARGETS = FuzzHandler FuzzChunkOf FuzzLogLine
 
 .PHONY: fuzz
+# The Go fuzz coordinator can report the end of -fuzztime itself as "context deadline exceeded" (it reads the
+# worker context before the deadline has propagated to it). Such a run found nothing: no input is saved and the
+# only error is that line. Any other failure, or a saved failing input, fails the target.
 fuzz: ## Run every fuzz target for FUZZTIME (default 30s)
-	@set -e; for f in $(FUZZ_TARGETS); do echo ">> $$f"; $(GO) test -run '^$$' -fuzz "^$$f$$" -fuzztime $(FUZZTIME) .; done
+	@for f in $(FUZZ_TARGETS); do echo ">> $$f"; \
+		out=$$($(GO) test -run '^$$' -fuzz "^$$f$$" -fuzztime $(FUZZTIME) . 2>&1) && { echo "$$out" | tail -1; continue; }; \
+		echo "$$out" | grep -v '^fuzz: elapsed'; \
+		if ! echo "$$out" | grep -q 'Failing input' && \
+			[ "$$(echo "$$out" | grep -E '^    ' | sed 's/^ *//')" = "context deadline exceeded" ]; then \
+			echo "(ignored: the fuzzing deadline itself, reported by the Go toolchain)"; continue; fi; \
+		exit 1; done
 
 .PHONY: lint
 lint: ## Run golangci-lint (v2) on every module

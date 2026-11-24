@@ -166,8 +166,9 @@ func TestMiddleware(t *testing.T) {
 		_ = e.Stats() // calls back into the executor while building the chain
 		return next
 	}
-	h := startHarness(t, admin, testConfig(admin.srv.URL), nil, WithLogger(quiet), WithMiddleware(mw("option"), reentrant))
+	h := startHarness(t, admin, testConfig(admin.srv.URL), nil, WithLogger(quiet))
 	e = h.e
+	e.Use(mw("option"), reentrant)
 	e.Use(mw("use"))
 	require.NoError(t, e.Register("T", HandlerFunc(noop), mw("own")))
 	require.NoError(t, e.Register("Broken", HandlerFunc(noop), func(Handler) Handler { panic("bad middleware") }))
@@ -256,7 +257,7 @@ func TestRun(t *testing.T) {
 					return ctx.Err()
 				}
 			})))
-			srv := httptest.NewServer(e.Handler())
+			srv := httptest.NewServer(e.HTTPHandler())
 			defer srv.Close()
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
@@ -392,7 +393,7 @@ func TestStats(t *testing.T) {
 
 func TestManyJobsAreBounded(t *testing.T) {
 	// Scenario: 300 distinct jobs are triggered while every run blocks, with MaxActiveTriggers 20
-	// Expect: only 20 are accepted (and so only 20 job goroutines exist); the rest are refused as busy
+	// Expect: only 20 are accepted, and 20 run (each on its own job goroutine); the rest are refused as busy
 	g := newGate()
 	h := newHarness(t, map[string]Handler{"G": g}, func(c *Config) { c.MaxActiveTriggers = 20 })
 
@@ -442,12 +443,13 @@ func TestFileLogStoreClosesFiles(t *testing.T) {
 	require.Eventually(t, func() bool { return openLogs() == 0 }, time.Second, 5*time.Millisecond) // every run ended its log
 	close(release)
 	late.Wait()
-	data, err := os.ReadFile(store.path(LogRef{LogID: 1, LogTime: time.Now()}))
+	data, err := os.ReadFile(store.path(LogRef{LogID: 1, LogTime: time.UnixMilli(h.admin.callback(t, 1).LogTime)}))
 	require.NoError(t, err)
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
 
 	assert.Zero(t, openLogs())
 	assert.NotContains(t, string(data), "late line")
-	assert.True(t, strings.HasSuffix(strings.TrimSpace(string(data)), `result=""`) || strings.Contains(string(data), "job succeeded"))
+	assert.Contains(t, lines[len(lines)-1], `msg="job succeeded"`)
 }
 
 func TestErrorThatPanicsDoesNotWedgeTheJob(t *testing.T) {
@@ -473,4 +475,93 @@ func TestErrorThatPanicsDoesNotWedgeTheJob(t *testing.T) {
 	assert.Equal(t, CodeSuccess, again.Code, "the job is not left busy")
 	assert.Equal(t, CodeSuccess, second.Code)
 	require.NoError(t, h.e.Shutdown(t.Context()))
+}
+
+// slowEndStore is a memory log store whose End takes a while, like a store that syncs to slow storage.
+type slowEndStore struct {
+	*MemoryLogStore
+	delay time.Duration
+}
+
+func (s slowEndStore) End(ref LogRef) error {
+	time.Sleep(s.delay)
+	return s.MemoryLogStore.End(ref)
+}
+
+func TestExecutionLogStatesTheReportedOutcome(t *testing.T) {
+	// Scenario: a 1s timeout; the handler returns at once, but ending its log takes 1.2s, past the timeout
+	// Expect: the outcome is decided once: the admin is told success and the execution log says the same (it used to
+	//         say "job succeeded" while the scheduler, deciding later, reported a timeout)
+	admin := newFakeAdmin(t)
+	store := slowEndStore{NewMemoryLogStore(0), 1200 * time.Millisecond}
+	h := startHarness(t, admin, testConfig(admin.srv.URL), map[string]Handler{"T": HandlerFunc(noop)},
+		WithLogger(quiet), WithLogStore(store))
+	now := time.Now()
+
+	h.run(t, trigger{JobID: 1, LogID: 1, LogDateTime: now.UnixMilli(), ExecutorHandler: "T", ExecutorTimeout: 1})
+	cb := h.admin.callback(t, 1)
+	var chunk LogChunk
+	require.Eventually(t, func() bool {
+		chunk, _ = store.Read(LogRef{LogID: 1, LogTime: now}, 1)
+		return chunk.End
+	}, 3*time.Second, 10*time.Millisecond)
+
+	assert.Equal(t, CodeSuccess, cb.Code)
+	assert.Contains(t, chunk.Content, `msg="job succeeded"`)
+}
+
+func TestWithoutServerRequiresAddress(t *testing.T) {
+	// Scenario: WithoutServer without Config.Address
+	// Expect: New fails instead of registering http://{IP}:9999/, where nothing listens
+	cfg := testConfig("http://admin")
+	cfg.Address = ""
+
+	_, err := New(cfg, WithoutServer(), WithLogger(quiet))
+
+	require.ErrorContains(t, err, "Config.Address is required with WithoutServer")
+}
+
+func TestTriggerDetails(t *testing.T) {
+	// Scenario: an undecodable run request; a trigger without a block strategy or a timeout, with DefaultTimeout 50ms
+	// Expect: the undecodable one is refused and counted as rejected; the handler sees BlockSerial, and is cancelled
+	//         with ErrTimeout after DefaultTimeout
+	seen := make(chan *Request, 1)
+	h := newHarness(t, map[string]Handler{"T": HandlerFunc(func(ctx context.Context, req *Request) error {
+		seen <- req
+		<-ctx.Done()
+		return ctx.Err()
+	})}, func(c *Config) { c.DefaultTimeout = 50 * time.Millisecond })
+
+	bad := h.post(t, h.e.proto.RunPath(), h.authHeaders(), "not an object")
+	h.run(t, trigger{JobID: 1, LogID: 1, ExecutorHandler: "T"})
+	req := <-seen
+	cb := h.admin.callback(t, 1)
+
+	assert.Equal(t, CodeFailure, bad.Code)
+	assert.Equal(t, int64(1), h.e.Stats().Rejected)
+	assert.Equal(t, BlockSerial, req.BlockStrategy)
+	assert.Equal(t, 50*time.Millisecond, req.Timeout)
+	assert.Equal(t, callback{cb.LogTime, CodeTimeout, ErrTimeout.Error(), "array"}, cb)
+}
+
+// readPanicStore is a log store whose Read panics.
+type readPanicStore struct{ LogStore }
+
+func (readPanicStore) Read(LogRef, int) (LogChunk, error) { panic("read exploded") }
+
+func TestRequestLimits(t *testing.T) {
+	// Scenario: a request body over 64 KiB; a log read from a store whose Read panics
+	// Expect: both get a JSON failure reply; the executor keeps serving
+	admin := newFakeAdmin(t)
+	h := startHarness(t, admin, testConfig(admin.srv.URL), map[string]Handler{"T": HandlerFunc(noop)},
+		WithLogger(quiet), WithLogStore(readPanicStore{NewMemoryLogStore(0)}))
+
+	big := h.run(t, trigger{JobID: 1, LogID: 1, ExecutorHandler: "T", ExecutorParams: strings.Repeat("p", 65<<10)})
+	read := h.post(t, "/log", h.authHeaders(), map[string]any{"logId": 1, "logDateTim": time.Now().UnixMilli(), "fromLineNum": 1})
+	beat := h.post(t, "/beat", h.authHeaders(), struct{}{})
+
+	assert.Equal(t, CodeFailure, big.Code)
+	assert.Contains(t, big.Msg, "invalid request body")
+	assert.Equal(t, reply{Code: CodeFailure, Msg: "read log failed"}, read)
+	assert.Equal(t, CodeSuccess, beat.Code)
 }

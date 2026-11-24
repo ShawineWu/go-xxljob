@@ -26,8 +26,8 @@ type CallbackConfig struct {
 // Callbacks reports run results to the admin. Results are queued and sent in batches by a background goroutine;
 // failed batches are retried. The queue is bounded by count and size: beyond either limit the oldest results are
 // saved to Dir (or dropped when there is none). Results still undelivered when it stops are saved too, and sent by
-// the next process using the same Dir. Saved results are loaded by Start, as far as the queue has room, and their
-// files are removed only once those results have been delivered or saved again: a crash in between sends them
+// the next process using the same Dir. Saved results are loaded by the sender, never before Start: when it starts
+// and then at every retry interval, as far as the queue has room. Their files are removed only once those results have been delivered or saved again: a crash in between sends them
 // twice, which the admin ignores, rather than losing them.
 type Callbacks struct {
 	client *Client
@@ -40,6 +40,7 @@ type Callbacks struct {
 	pending     []wire.Result
 	bytes       int
 	inflight    int
+	saving      int // overflow taken out of the queue and not saved yet: the claimed files must stay until it is
 	lastFailure time.Time
 	closed      bool
 
@@ -65,17 +66,9 @@ func NewCallbacks(client *Client, log *slog.Logger, cfg CallbackConfig) (*Callba
 	return c, nil
 }
 
-// Start loads saved results, including those a crashed process had loaded but not delivered, and starts the
-// background sender.
-func (c *Callbacks) Start() {
-	if c.spool != nil {
-		if err := c.spool.adopt(); err != nil {
-			c.log.Error("xxljob: recover callbacks loaded by a previous process", "dir", c.cfg.Dir, "err", err)
-		}
-	}
-	c.reload()
-	go c.loop()
-}
+// Start starts the background sender. It does not block: the sender first loads the saved results, including
+// those a crashed process had loaded but not delivered.
+func (c *Callbacks) Start() { go c.loop() }
 
 // Push queues a result. It never blocks on the network.
 func (c *Callbacks) Push(r wire.Result) {
@@ -89,7 +82,7 @@ func (c *Callbacks) Push(r wire.Result) {
 	c.bytes += size(r)
 	overflow := c.trim()
 	c.mu.Unlock()
-	c.lose(overflow, "callback queue full")
+	c.saveOverflow(overflow)
 	select {
 	case c.notify <- struct{}{}:
 	default:
@@ -131,6 +124,12 @@ func (c *Callbacks) Close(ctx context.Context) {
 
 func (c *Callbacks) loop() {
 	defer close(c.done)
+	if c.spool != nil {
+		if err := c.spool.adopt(); err != nil {
+			c.log.Error("xxljob: recover callbacks loaded by a previous process", "dir", c.cfg.Dir, "err", err)
+		}
+	}
+	c.reload()
 	tick := time.NewTicker(c.cfg.RetryInterval)
 	defer tick.Stop()
 	for {
@@ -138,6 +137,9 @@ func (c *Callbacks) loop() {
 		case <-c.ctx.Done():
 			return
 		case <-c.notify:
+			if c.ctx.Err() != nil {
+				return // select picks at random among ready cases: Close must not wait for another request
+			}
 			// After a failure, wait for the retry interval instead of hitting an unavailable admin on every result.
 			c.mu.Lock()
 			backoff := time.Since(c.lastFailure) < c.cfg.RetryInterval
@@ -146,6 +148,9 @@ func (c *Callbacks) loop() {
 				c.flush(c.ctx)
 			}
 		case <-tick.C:
+			if c.ctx.Err() != nil {
+				return
+			}
 			c.flush(c.ctx)
 			c.reload()
 		}
@@ -180,7 +185,7 @@ func (c *Callbacks) flush(ctx context.Context) {
 			pending := len(c.pending)
 			overflow := c.trim()
 			c.mu.Unlock()
-			c.lose(overflow, "callback queue full")
+			c.saveOverflow(overflow)
 			if ok, n := c.warn.Allow(); ok && ctx.Err() == nil {
 				c.log.Error("xxljob: callback failed, will retry", "pending", pending, "err", err, "suppressed", n)
 			}
@@ -197,7 +202,8 @@ func (c *Callbacks) flush(ctx context.Context) {
 }
 
 // trim removes the oldest results beyond the limits, down to nine tenths of them so that a full queue does not copy
-// itself on every push. It always keeps the newest result. Called with c.mu held.
+// itself on every push. It always keeps the newest result. The caller must hand what it returns to saveOverflow.
+// Called with c.mu held.
 func (c *Callbacks) trim() []wire.Result {
 	if len(c.pending) <= c.cfg.MaxPending && c.bytes <= c.cfg.MaxBytes {
 		return nil
@@ -209,7 +215,22 @@ func (c *Callbacks) trim() []wire.Result {
 	}
 	out := slices.Clone(c.pending[:n])
 	c.pending = slices.Clone(c.pending[n:])
+	if n > 0 {
+		c.saving++
+	}
 	return out
+}
+
+// saveOverflow saves (or logs as lost) what trim took out of the queue. Until it has, the claimed files stay: those
+// results may be theirs.
+func (c *Callbacks) saveOverflow(results []wire.Result) {
+	if len(results) == 0 {
+		return
+	}
+	c.lose(results, "callback queue full")
+	c.mu.Lock()
+	c.saving--
+	c.mu.Unlock()
 }
 
 // reload queues saved results while the queue has room.
@@ -241,13 +262,13 @@ func (c *Callbacks) reload() {
 }
 
 // release removes the saved files whose results have all been delivered or saved again: called when the queue is
-// empty, or by Close once whatever was left has been saved.
+// empty and no overflow is being saved, or by Close once whatever was left has been saved.
 func (c *Callbacks) release() {
 	if c.spool == nil {
 		return
 	}
 	c.mu.Lock()
-	idle := len(c.pending) == 0 && c.inflight == 0
+	idle := len(c.pending) == 0 && c.inflight == 0 && c.saving == 0
 	c.mu.Unlock()
 	if idle {
 		if err := c.spool.release(); err != nil {

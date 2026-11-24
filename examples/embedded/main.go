@@ -43,7 +43,7 @@ func run() error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
-	mux.Handle("/xxl-job/", http.StripPrefix("/xxl-job", exec.Handler()))
+	mux.Handle("/xxl-job/", http.StripPrefix("/xxl-job", exec.HTTPHandler()))
 	srv := &http.Server{Addr: ":8081", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
 	go func() {

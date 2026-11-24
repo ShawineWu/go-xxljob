@@ -2,7 +2,7 @@
 //
 // It implements the executor side of XXL-JOB (https://github.com/xuxueli/xxl-job): it registers with the admin,
 // runs triggered jobs, reports their results, serves execution logs and shuts down gracefully. It supports admin
-// 2.3.0 – 3.5.x and depends only on the standard library.
+// 2.3.0 – 3.5.x and has no dependencies outside the standard library.
 //
 //	exec, err := xxljob.New(xxljob.Config{
 //		AdminAddresses: []string{"http://xxl-job-admin:8080/xxl-job-admin"},

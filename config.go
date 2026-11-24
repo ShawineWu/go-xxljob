@@ -88,7 +88,7 @@ type Config struct {
 	// README's "Resource limits".
 	MaxActiveTriggers int
 	// MaxConcurrency caps runs executing at once across all jobs. 0 means no limit. Triggers waiting for a slot
-	// count as running and can be killed; at shutdown they are discarded like queued ones.
+	// count as running and can be killed; at shutdown they fail with ErrShutdown without running, like queued ones.
 	MaxConcurrency int
 
 	// DefaultTimeout applies to runs the admin sends without a timeout. 0 means no limit. At the timeout the run is
@@ -135,15 +135,19 @@ func (c Config) normalize() (Config, error) {
 	c.AccessToken = strings.TrimSpace(c.AccessToken)
 	c.AdminVersion = cmp.Or(strings.TrimSpace(c.AdminVersion), AdminVersion2)
 
-	for name, v := range map[string]int64{
-		"Port": int64(c.Port), "MaxPendingCallbacks": int64(c.MaxPendingCallbacks), "MaxQueueSize": int64(c.MaxQueueSize),
-		"MaxActiveTriggers": int64(c.MaxActiveTriggers), "MaxConcurrency": int64(c.MaxConcurrency),
-		"RegistryInterval": int64(c.RegistryInterval), "RequestTimeout": int64(c.RequestTimeout),
-		"CallbackRetryInterval": int64(c.CallbackRetryInterval), "DefaultTimeout": int64(c.DefaultTimeout),
-		"ShutdownTimeout": int64(c.ShutdownTimeout), "CancelWait": int64(c.CancelWait),
+	for _, f := range []struct {
+		name string
+		v    int64
+	}{
+		{"Port", int64(c.Port)}, {"MaxPendingCallbacks", int64(c.MaxPendingCallbacks)},
+		{"MaxQueueSize", int64(c.MaxQueueSize)}, {"MaxActiveTriggers", int64(c.MaxActiveTriggers)},
+		{"MaxConcurrency", int64(c.MaxConcurrency)}, {"RegistryInterval", int64(c.RegistryInterval)},
+		{"RequestTimeout", int64(c.RequestTimeout)}, {"CallbackRetryInterval", int64(c.CallbackRetryInterval)},
+		{"DefaultTimeout", int64(c.DefaultTimeout)}, {"ShutdownTimeout", int64(c.ShutdownTimeout)},
+		{"CancelWait", int64(c.CancelWait)},
 	} {
-		if v < 0 {
-			return c, fmt.Errorf("xxljob: %s must not be negative", name)
+		if f.v < 0 {
+			return c, fmt.Errorf("xxljob: %s must not be negative", f.name)
 		}
 	}
 	c.Port = cmp.Or(c.Port, DefaultPort)
@@ -203,7 +207,6 @@ type options struct {
 	logger        *slog.Logger
 	logStore      LogStore
 	httpClient    *http.Client
-	middlewares   []Middleware
 	withoutServer bool
 }
 
@@ -225,13 +228,8 @@ func WithHTTPClient(c *http.Client) Option {
 	return func(o *options) { o.httpClient = c }
 }
 
-// WithMiddleware adds middlewares applied to every handler, outermost first.
-func WithMiddleware(mws ...Middleware) Option {
-	return func(o *options) { o.middlewares = append(o.middlewares, mws...) }
-}
-
-// WithoutServer makes the executor skip listening on Config.Port: mount Executor.Handler on your own HTTP server,
-// before calling Start, and set Config.Address to the matching URL.
+// WithoutServer makes the executor skip listening on Config.Port: mount Executor.HTTPHandler on your own HTTP
+// server, before calling Start, and set Config.Address (required) to the URL it is reachable at.
 func WithoutServer() Option {
 	return func(o *options) { o.withoutServer = true }
 }

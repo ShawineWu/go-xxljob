@@ -35,8 +35,9 @@ func (r *Registry) Start() { go r.loop() }
 // Registered reports whether the last heartbeat succeeded.
 func (r *Registry) Registered() bool { return r.registered.Load() }
 
-// Close stops the heartbeat, waits for the one in progress (it ends within its request timeout, one per admin
-// address), then deregisters. It gives up when ctx is done.
+// Close stops the heartbeat and waits for the one in progress until ctx is done, then deregisters. The
+// deregistration is sent even when ctx is done, bounded by the request timeout (one per admin address it fails over
+// to): telling the admin to stop routing here matters most when time is short.
 func (r *Registry) Close(ctx context.Context) {
 	close(r.stop)
 	select {
@@ -44,7 +45,7 @@ func (r *Registry) Close(ctx context.Context) {
 	case <-ctx.Done():
 	}
 	r.registered.Store(false)
-	if err := r.client.Post(ctx, wire.ActionRegistryRemove, r.param); err != nil {
+	if err := r.client.Post(context.WithoutCancel(ctx), wire.ActionRegistryRemove, r.param); err != nil {
 		r.log.Error("xxljob: registryRemove failed", "app_name", r.param.RegistryKey, "address", r.param.RegistryValue, "err", err)
 	}
 }

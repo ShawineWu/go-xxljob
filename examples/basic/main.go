@@ -42,10 +42,11 @@ func run(logger *slog.Logger) error {
 		AppName:        envOr("XXL_JOB_APPNAME", "go-demo"),
 		DefaultTimeout: 10 * time.Minute,                    // bounds jobs configured without a timeout
 		CallbackDir:    filepath.Join(dataDir, "callbacks"), // results undelivered at shutdown are sent by the next run
-	}, xxljob.WithLogger(logger), xxljob.WithLogStore(logs), xxljob.WithMiddleware(recordDuration(logger)))
+	}, xxljob.WithLogger(logger), xxljob.WithLogStore(logs))
 	if err != nil {
 		return err
 	}
+	exec.Use(recordDuration(logger))
 
 	exec.MustRegister("Hello", xxljob.HandlerFunc(hello))
 	exec.MustRegisterTasks(&SyncItemsTask{batchSize: 500}, ShardTask{})

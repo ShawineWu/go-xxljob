@@ -24,7 +24,8 @@ XXL-JOB is a widely used distributed task scheduler: the **admin** (scheduling c
 - **Complete:** kill, timeouts, execution logs in the admin UI, sharding broadcast, result callbacks with retries
   (and optionally saved across restarts), graceful shutdown, OpenTelemetry ([`otelxxljob`](#tracing-and-metrics-opentelemetry)).
 - **Easy to test:** `xxljob.Invoke` runs a handler without an admin, exactly as the executor would.
-- **Zero dependencies** beyond the Go standard library (the OpenTelemetry integration is a separate module).
+- **No runtime dependencies** beyond the Go standard library (testify is used by tests only; the OpenTelemetry
+  integration is a separate module).
 
 ## Contents
 
@@ -225,9 +226,8 @@ Options passed to `New`:
 |---|---|---|
 | `WithLogger(*slog.Logger)` | `slog.Default()` | Logger for the executor and the application side of job logs |
 | `WithLogStore(LogStore)` | in memory, 16 MiB | Where execution logs are kept |
-| `WithMiddleware(...)` | none | Middleware applied to every job |
 | `WithHTTPClient(*http.Client)` | `&http.Client{}` | Client for requests to the admin (copied; never follows redirects) |
-| `WithoutServer()` | off | Don't listen; mount `exec.Handler()` yourself before starting |
+| `WithoutServer()` | off | Don't listen; mount `exec.HTTPHandler()` yourself before starting (requires `Address`) |
 
 ## Deployment
 
@@ -235,8 +235,8 @@ Options passed to `New`:
 
 When `Run`'s context ends (or on `Shutdown(ctx)`), the executor stops accepting triggers, deregisters, waits for
 running jobs for `ShutdownTimeout` (or until `ctx` expires), cancels whatever is left, and delivers the remaining
-results. Every step is bounded: with one admin address, shutdown takes at most `ShutdownTimeout + RequestTimeout +
-2×CancelWait + 1s` (when `RequestTimeout ≤ CancelWait` and `ShutdownTimeout ≥ 2×RequestTimeout`), 25s with the defaults, within Kubernetes' default `terminationGracePeriodSeconds` of 30s. If you
+results. Every step is bounded: with one admin address, shutdown takes at most `ShutdownTimeout + CancelWait +
+max(CancelWait, RequestTimeout) + RequestTimeout + 1s` (when `ShutdownTimeout ≥ 2×RequestTimeout`), 25s with the defaults, within Kubernetes' default `terminationGracePeriodSeconds` of 30s. If you
 raise `ShutdownTimeout` for longer jobs, raise the grace period with it.
 
 ### Keeping results across restarts
@@ -276,7 +276,8 @@ Everything the executor holds is bounded:
 | Concurrent handler runs | `MaxConcurrency` when set |
 | Execution logs in memory | 16 MiB (`NewMemoryLogStore`), at most 1/8 per run, oldest finished runs evicted first |
 | Execution logs on disk | 16 MiB per run (`FileLogStore`), kept for the retention period; one open file per running run |
-| Undelivered results | `MaxPendingCallbacks` and 64 MiB; beyond that, saved to `CallbackDir` or dropped and logged |
+| Execution log reads | 4 `/log` requests served at once; the others wait their turn |
+| Undelivered results | `MaxPendingCallbacks` and 64 MiB; beyond that, saved to `CallbackDir` (at most 512 MiB) or dropped and logged |
 | Shutdown time | see [Graceful shutdown](#graceful-shutdown) |
 
 ## Advanced usage
@@ -296,8 +297,8 @@ exec.Use(func(next xxljob.Handler) xxljob.Handler {
 })
 ```
 
-Middleware for a single job goes in `Register(name, handler, middlewares...)`. Chains are built when a trigger is
-accepted, so `Use` applies to triggers accepted afterwards. Code deeper in the call stack can read the current
+Middleware for a single job goes in `Register(name, handler, middlewares...)`. Chains are built when a run
+starts, so `Use` applies to runs that start afterwards, including triggers already queued. Code deeper in the call stack can read the current
 trigger with `xxljob.RequestFrom(ctx)`.
 
 ### Tracing and metrics (OpenTelemetry)
@@ -355,7 +356,7 @@ exec, _ := xxljob.New(xxljob.Config{
 	// ...
 	Address: "http://10.0.0.8:8080/xxl-job/", // the URL the admin uses to reach this executor
 }, xxljob.WithoutServer())
-mux.Handle("/xxl-job/", http.StripPrefix("/xxl-job", exec.Handler())) // mount before starting
+mux.Handle("/xxl-job/", http.StripPrefix("/xxl-job", exec.HTTPHandler())) // mount before starting
 go server.ListenAndServe()
 err := exec.Run(ctx) // registration and callbacks; your server serves the admin's requests
 ```
@@ -410,11 +411,11 @@ that cannot receive triggers. The registration is renewed every `RegistryInterva
 `Shutdown(ctx)` follows a plan fixed when it begins:
 
 1. reject new triggers (liveness checks fail too, so failover routing moves work to other instances);
-2. stop the heartbeat, wait for the one in progress, and deregister (at most `2×RequestTimeout`);
+2. stop the heartbeat, wait for the one in progress, and deregister (at most `RequestTimeout` each);
 3. discard queued triggers and triggers waiting for a slot; wait for running jobs until `ctx` expires, then cancel
    them and wait at most `CancelWait` more;
-4. deliver the remaining results (at least `CancelWait`, and always one more attempt); save the rest to
-   `CallbackDir` (up to 512 MiB), or log them as lost;
+4. deliver the remaining results (at least `CancelWait`, plus the request in progress and one more attempt); save
+   the rest to `CallbackDir` (up to 512 MiB), or log them as lost;
 5. close the executor port last, so the admin can still kill jobs while it waits.
 
 ### Protocol versions
@@ -449,8 +450,8 @@ make stress     # repeat the concurrency stress tests
 make bench      # benchmarks
 ```
 
-- **Scheduler tests** run on a fake clock (`testing/synctest`): timeouts, kills, cover-early and shutdown are
-  checked at exact instants, without sleeps or flakiness.
+- **Scheduler tests** run mostly on a fake clock (`testing/synctest`): timeouts, kills, cover-early and shutdown
+  are checked at exact instants, without sleeps or flakiness.
 - **Unit tests** cover the protocols, the HTTP endpoints, callbacks (failover, retries, bounds, spool), the log
   stores and the lifecycle against a fake admin.
 - **Stress tests** fire hundreds of random operations at many jobs and check invariants: every accepted trigger is

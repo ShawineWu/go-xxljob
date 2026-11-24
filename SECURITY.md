@@ -20,4 +20,8 @@ published, crediting you unless you prefer otherwise.
 - Do not expose the executor port publicly; only the admin needs to reach it.
 - The executor only runs BEAN jobs compiled into your binary. GLUE scripts sent by the admin are rejected.
 - `CallbackDir` holds run results (log IDs and result messages); the executor creates its files readable by its own
-  user only. Keep the directory private like any application data.
+  user only. Keep the directory private like any application data, and use one directory per executor process:
+  whoever can write to it can report results for any run. The executor reads only regular files from it, never
+  blocks on special files, and caps what it loads (512 MiB of files, lines of 1 MiB, messages of 50000 characters).
+- `FileLogStore` removes only its own log files (`{logId}.log` in date directories) when cleaning up; give it a
+  directory of its own anyway.

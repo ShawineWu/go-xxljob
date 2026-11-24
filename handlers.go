@@ -21,11 +21,8 @@ type registered struct {
 	mws []Middleware
 }
 
-func newHandlerSet(global []Middleware) (*handlerSet, error) {
-	if err := checkMiddlewares(global); err != nil {
-		return nil, err
-	}
-	return &handlerSet{byName: map[string]registered{}, global: slices.Clone(global)}, nil
+func newHandlerSet() *handlerSet {
+	return &handlerSet{byName: map[string]registered{}}
 }
 
 // add registers handlers atomically: either all of them or, on error, none.

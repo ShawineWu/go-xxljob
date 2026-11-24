@@ -20,9 +20,10 @@ import (
 func runOnce(t *testing.T, ctx context.Context, h Handler) (code int, msg string, err error) {
 	t.Helper()
 	_, app := capture()
-	res, err := runner{store: NewMemoryLogStore(0), app: app}.run(ctx, h, Request{Handler: "T", ShardTotal: 1},
+	res, finish, err := runner{store: NewMemoryLogStore(0), app: app}.run(ctx, h, Request{Handler: "T", ShardTotal: 1},
 		LogRef{LogID: 1, LogTime: time.Now()})
 	o := sched.Classify(context.Cause(ctx), res)
+	finish(o)
 	return codeOf(o.Status), o.Msg, err
 }
 
@@ -111,7 +112,8 @@ func TestExecutionLogLines(t *testing.T) {
 		return nil
 	})
 
-	_, err := runner{store: store, app: app}.run(t.Context(), h, Request{Handler: "T", Params: "p", ShardTotal: 1}, ref)
+	res, finish, err := runner{store: store, app: app}.run(t.Context(), h, Request{Handler: "T", Params: "p", ShardTotal: 1}, ref)
+	finish(sched.Classify(nil, res))
 	chunk, _ := store.Read(ref, 1)
 	lines := strings.Split(strings.TrimSuffix(chunk.Content, "\n"), "\n")
 
@@ -132,9 +134,10 @@ func TestLongRunningWarning(t *testing.T) {
 	store := NewMemoryLogStore(0)
 	ref := LogRef{LogID: 1, LogTime: time.Now()}
 
-	res, _ := runner{store: store, app: app, longRunning: 30 * time.Millisecond}.run(t.Context(),
+	res, finish, _ := runner{store: store, app: app, longRunning: 30 * time.Millisecond}.run(t.Context(),
 		HandlerFunc(func(context.Context, *Request) error { time.Sleep(100 * time.Millisecond); return nil }),
 		Request{Handler: "T", ShardTotal: 1}, ref)
+	finish(sched.Classify(nil, res))
 	chunk, _ := store.Read(ref, 1)
 
 	assert.False(t, res.Failed)
@@ -163,11 +166,12 @@ func TestFaultyLogStore(t *testing.T) {
 			// Expect: the run itself is unaffected; the failure is reported once to the application log
 			appLog, app := capture()
 
-			res, err := runner{store: faultyStore{panics}, app: app}.run(t.Context(), HandlerFunc(func(ctx context.Context, _ *Request) error {
+			res, finish, err := runner{store: faultyStore{panics}, app: app}.run(t.Context(), HandlerFunc(func(ctx context.Context, _ *Request) error {
 				Logger(ctx).Info("one")
 				Logger(ctx).Info("two")
 				return nil
 			}), Request{Handler: "T", ShardTotal: 1}, LogRef{LogID: 1})
+			finish(sched.Classify(nil, res))
 
 			require.NoError(t, err)
 			assert.False(t, res.Failed)
@@ -195,10 +199,28 @@ func TestInvoke(t *testing.T) {
 	assert.Equal(t, "counted 2", ok.Msg)
 	assert.Contains(t, ok.Log[0], "handler=Count")
 	assert.Contains(t, ok.Log[2], "i=1")
-	assert.Equal(t, Result{Err: failed.Err, Code: CodeFailure, Msg: "bad", Log: failed.Log}, failed)
+	assert.Equal(t, InvokeResult{Err: failed.Err, Code: CodeFailure, Msg: "bad", Log: failed.Log}, failed)
 	assert.Equal(t, "panic: boom", panicked.Msg)
 	assert.Equal(t, CodeTimeout, timedOut.Code)
 	assert.Equal(t, ErrTimeout.Error(), timedOut.Msg)
+}
+
+func TestInvokeErrIsTheCause(t *testing.T) {
+	// Scenario: two handlers outlive a 10ms timeout: one returns ctx.Err() as it should, one ignores it and returns nil
+	// Expect: both report ErrTimeout as Err, whatever the handler returned
+	wellBehaved := Invoke(t.Context(), HandlerFunc(func(ctx context.Context, _ *Request) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}), &Request{Timeout: 10 * time.Millisecond})
+	ignoring := Invoke(t.Context(), HandlerFunc(func(context.Context, *Request) error {
+		time.Sleep(30 * time.Millisecond)
+		return nil
+	}), &Request{Timeout: 10 * time.Millisecond})
+
+	require.ErrorIs(t, wellBehaved.Err, ErrTimeout)
+	require.ErrorIs(t, ignoring.Err, ErrTimeout)
+	assert.Equal(t, CodeTimeout, wellBehaved.Code)
+	assert.Equal(t, CodeTimeout, ignoring.Code)
 }
 
 type countTask struct{}

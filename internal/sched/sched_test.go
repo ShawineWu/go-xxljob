@@ -151,12 +151,12 @@ func TestCoverEarly(t *testing.T) {
 		require.NoError(t, s.Submit(rec.trigger(1, 3, CoverEarly, succeed)))
 		synctest.Wait()
 		coveredAt := rec.reported(1)
-		startedEarly := rec.reported(3)
+		reportedEarly := rec.reported(3)
 		time.Sleep(10 * time.Second)
 		synctest.Wait()
 
 		assert.True(t, coveredAt, "covered run reported immediately")
-		assert.False(t, startedEarly, "new trigger waits for the covered run to return")
+		assert.False(t, reportedEarly, "new trigger waits for the covered run to return")
 		assert.Equal(t, Outcome{Failed, ErrCovered.Error()}, rec.outcome(t, 1))
 		assert.Equal(t, Outcome{Failed, "trigger discarded: " + ErrCovered.Error()}, rec.outcome(t, 2))
 		assert.Equal(t, Succeeded, rec.outcome(t, 3).Status)
@@ -251,7 +251,7 @@ func TestTimeout(t *testing.T) {
 
 func TestMaxConcurrency(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		// Scenario: concurrency limit 2 with 4 jobs triggered at once; job 3 is killed while waiting for a slot
+		// Scenario: concurrency limit 2 with 4 jobs triggered at once; a job still waiting for a slot is killed
 		// Expect: never more than 2 runs at once; waiting triggers count as running; the killed one never runs
 		var mu sync.Mutex
 		active, peak := 0, 0
@@ -501,7 +501,8 @@ func TestPanickingRunFails(t *testing.T) {
 func TestMaxActiveBoundsJobThreads(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		// Scenario: 500 distinct jobs are triggered while every run blocks, with at most 50 active triggers
-		// Expect: only 50 are accepted, so only 50 job goroutines exist; once they finish new triggers are accepted
+		// Expect: only 50 are accepted, and 50 run (each on its own job goroutine); once they finish new triggers are
+		//         accepted
 		rec := newRecorder()
 		s := New(Config{MaxActive: 50}, rec.report)
 		release := make(chan struct{})
@@ -603,4 +604,45 @@ func TestCloseWaitsForCancellationReports(t *testing.T) {
 
 		require.False(t, late.Load(), "run %d: reported after Close returned", i)
 	}
+}
+
+func TestDoneGetsTheReportedOutcome(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Scenario: a run that ignores cancellation is killed, then returns success; another run just succeeds
+		// Expect: Done is called after Run returns, with the outcome that was reported (killed), not with what Run
+		//         returned; for the other run, with its success
+		rec := newRecorder()
+		s := New(Config{}, rec.report)
+		var done sync.Map
+		withDone := func(tr *Trigger) *Trigger {
+			tr.Done = func(o Outcome) { done.Store(tr.LogID, o) }
+			return tr
+		}
+
+		require.NoError(t, s.Submit(withDone(rec.trigger(1, 1, Serial, stubborn(time.Second)))))
+		require.NoError(t, s.Submit(withDone(rec.trigger(2, 2, Serial, succeed))))
+		synctest.Wait()
+		s.Kill(1)
+		synctest.Wait()
+		_, doneEarly := done.Load(int64(1))
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		killed, _ := done.Load(int64(1))
+		ok, _ := done.Load(int64(2))
+
+		assert.False(t, doneEarly, "Done waits for Run to return")
+		assert.Equal(t, rec.outcome(t, 1), killed)
+		assert.Equal(t, Outcome{Failed, ErrKilled.Error()}, killed)
+		assert.Equal(t, Succeeded, ok.(Outcome).Status)
+	})
+}
+
+func TestNormalizeStrategy(t *testing.T) {
+	// Scenario: the strategies the admin sends, nothing, and an unknown value
+	// Expect: known strategies are kept; anything else is Serial, as the scheduler treats it
+	assert.Equal(t, DiscardLater, NormalizeStrategy(DiscardLater))
+	assert.Equal(t, CoverEarly, NormalizeStrategy(CoverEarly))
+	assert.Equal(t, Serial, NormalizeStrategy(Serial))
+	assert.Equal(t, Serial, NormalizeStrategy(""))
+	assert.Equal(t, Serial, NormalizeStrategy("FIFO"))
 }

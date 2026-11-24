@@ -109,7 +109,7 @@ func WithLogTraceID(enabled bool) Option {
 
 // Instrument installs Middleware on exec and registers ObserveStats, both tagged with exec's AppName. Call it before
 // Start, and before adding other middlewares with Use if the span should cover them: the middleware applies to
-// triggers accepted afterwards, around the middlewares added after it.
+// runs that start afterwards, around the middlewares added after it.
 func Instrument(exec *xxljob.Executor, opts ...Option) (metric.Registration, error) {
 	opts = append(slices.Clone(opts), WithAttributes(AttrAppName.String(exec.Config().AppName)))
 	reg, err := ObserveStats(exec, opts...)
@@ -192,7 +192,8 @@ func requestAttrs(req *xxljob.Request, extra []attribute.KeyValue) []attribute.K
 }
 
 // resultOf classifies a finished run by the cancellation cause of its context, which wins over what the handler
-// returned (as it does for the result the executor reports), then by its error.
+// returned (as it does for the result the executor reports), then by its error. It sees the run as the handler
+// returned: a cancellation arriving after that, which the executor may still report, is not reflected.
 func resultOf(ctx context.Context, err error) string {
 	switch cause := context.Cause(ctx); {
 	case errors.Is(cause, xxljob.ErrTimeout):

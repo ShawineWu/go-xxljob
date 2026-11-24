@@ -35,7 +35,13 @@ explicit. It fixes the problems found by an audit of v0.1.0.
 - Execution logs are returned from the requested line to the end, as by the official executor (the admin's log view
   of a finished run reads only one page). `FileLogStore` caps each run at 16 MiB; its retention keeps exactly the last
   `RetentionDays` days and also removes directories dated further ahead than a trigger's log time may be.
-- `NewFileLogStore` takes a `FileLogStoreConfig` (`Dir`, `RetentionDays`, and `MaxRunBytes`, the per-run cap).
+- `NewFileLogStore` takes a `FileLogStoreConfig` (`Dir`, `RetentionDays`, and `MaxRunBytes`, the per-run cap). Its
+  cleanup removes only its own log files.
+- `Executor.Handler()` is now `HTTPHandler()` (and returns the same handler every time); `WithMiddleware` is removed
+  (use `Executor.Use`); `Invoke` returns an `InvokeResult`, whose `Err` is the cancellation cause whenever the run
+  was cancelled. `WithoutServer` requires `Config.Address`.
+- Middleware chains are built when a run starts, so `Use` also applies to triggers already queued.
+- `Request.BlockStrategy` is always one of the `Block*` constants (`BlockSerial` when the admin sent none).
 - Request bodies and headers from the admin are capped at 64 KiB (was 256 KiB for bodies).
 - `Request.BindJSON` errors no longer include the job parameters.
 - otelxxljob: `Instrument(exec)` sets everything up and tags it with the AppName; running, queued and pending
@@ -66,7 +72,12 @@ explicit. It fixes the problems found by an audit of v0.1.0.
   executor.
 - A heartbeat in progress at shutdown could reach the admin after the deregistration and register the executor again.
 - A handler error whose `Error` method panicked (for example a typed nil) left its job busy forever.
-- A `LogStore` whose `Close` panicked crashed `Shutdown`.
+- A `LogStore` whose `Close` panicked crashed `Shutdown`; one whose `Read` panicked broke the admin's log view.
+- The execution log could state another outcome than the one reported to the admin (a cancellation arriving after
+  the handler returned): the outcome is now decided once and the log's last line is written from it.
+- `MemoryLogStore` could evict a running run's log and then start a new one for it, numbered from line 1.
+- `FileLogStore` reopened files when an abandoned run logged after `Close`.
+- `Stats.Rejected` did not count run requests that could not be decoded.
 - The default memory log store copied its whole index on every eviction once full (about 1000× slower writes).
 - `FileLogStore` reopened (and leaked) a run's file when something logged after the run ended; writes after a run
   has ended are now dropped. A failing or panicking log store no longer crashes the executor.

@@ -71,7 +71,7 @@ func (c *Client) post(ctx context.Context, url string, body []byte) error {
 	if err != nil {
 		return fmt.Errorf("build request %s: %w", url, err)
 	}
-	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
+	req.Header.Set("Content-Type", wire.ContentType)
 	c.proto.SetHeaders(req.Header)
 	resp, err := c.http.Do(req)
 	if err != nil {

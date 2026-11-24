@@ -57,7 +57,7 @@ func ExampleWithoutServer() {
 		panic(err)
 	}
 	mux := http.NewServeMux()
-	mux.Handle("/xxl-job/", http.StripPrefix("/xxl-job", exec.Handler())) // mount before starting
+	mux.Handle("/xxl-job/", http.StripPrefix("/xxl-job", exec.HTTPHandler())) // mount before starting
 	srv := &http.Server{Addr: ":8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() { _ = srv.ListenAndServe() }()
 

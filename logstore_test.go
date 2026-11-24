@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -76,6 +77,24 @@ func accounted(s *MemoryLogStore) int {
 	return n
 }
 
+func TestMemoryLogStoreEvictedRunStaysEvicted(t *testing.T) {
+	// Scenario: a store of 1 KiB; a running run's log is evicted by other running runs, then the first run logs again
+	// Expect: its later lines are dropped instead of starting a new log numbered from 1; its log reads as not found
+	s := NewMemoryLogStore(1024)
+	victim := LogRef{LogID: 1}
+	require.NoError(t, s.Write(victim, "victim line 1"))
+	for id := int64(2); id <= 20; id++ {
+		require.NoError(t, s.Write(LogRef{LogID: id}, strings.Repeat("n", 50)))
+	}
+	_, evicted := s.Read(victim, 1)
+
+	require.NoError(t, s.Write(victim, "victim line 2"))
+	_, err := s.Read(victim, 1)
+
+	require.ErrorIs(t, evicted, ErrLogNotFound, "the scenario evicts the victim")
+	require.ErrorIs(t, err, ErrLogNotFound)
+}
+
 func TestMemoryLogStoreEvictionIsCheap(t *testing.T) {
 	// Scenario: a full 1MB store keeps receiving lines of new runs
 	// Expect: every write stays cheap (eviction does not copy the store's index)
@@ -85,12 +104,18 @@ func TestMemoryLogStoreEvictionIsCheap(t *testing.T) {
 		require.NoError(t, s.End(LogRef{LogID: id}))
 	}
 
-	allocs := testing.AllocsPerRun(1000, func() {
-		id := time.Now().UnixNano()
-		_ = s.Write(LogRef{LogID: id}, strings.Repeat("y", 100))
-	})
+	line := strings.Repeat("y", 100)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for id := range int64(1000) {
+		_ = s.Write(LogRef{LogID: 1_000_000 + id}, line)
+	}
+	runtime.ReadMemStats(&after)
+	perWrite := (after.TotalAlloc - before.TotalAlloc) / 1000
 
-	assert.Less(t, allocs, 10.0)
+	// Copying the index of 20000 logs would allocate over 100 KB per write; a write needs a few hundred bytes.
+	assert.Less(t, perWrite, uint64(4<<10))
 }
 
 func TestFileLogStore(t *testing.T) {
@@ -168,7 +193,8 @@ func TestFileLogStoreRetention(t *testing.T) {
 	// Scenario: 3-day retention with date directories from today back to 10 days ago, some within the clock skew a
 	//           trigger may have (7 days ahead), some far in the future, and a directory that is not a date
 	// Expect: exactly 3 days are kept (today and the two before) plus the ones a trigger may still write to; old and
-	//         far-future directories are removed; other directories are left alone
+	//         far-future directories are removed; files that are not logs of this store, and their directory, are
+	//         left alone
 	dir := t.TempDir()
 	s, err := NewFileLogStore(FileLogStoreConfig{Dir: dir, RetentionDays: 3})
 	require.NoError(t, err)
@@ -177,7 +203,12 @@ func TestFileLogStoreRetention(t *testing.T) {
 	day := func(offset int) string { return now.AddDate(0, 0, offset).Format(time.DateOnly) }
 	for _, name := range []string{day(0), day(-1), day(-2), day(-3), day(-10), day(1), day(7), day(9), day(400), "9999-12-31", "not-a-date"} {
 		require.NoError(t, os.MkdirAll(filepath.Join(dir, name), 0o750))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name, "42.log"), []byte("x\n"), 0o600))
 	}
+	foreign := filepath.Join(dir, day(-5), "precious.db") // not a log of this store, in an expired date directory
+	require.NoError(t, os.MkdirAll(filepath.Dir(foreign), 0o750))
+	require.NoError(t, os.WriteFile(foreign, []byte("keep"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, day(-5), "7.log"), []byte("x\n"), 0o600))
 
 	s.clean(now)
 	entries, err := os.ReadDir(dir)
@@ -187,7 +218,9 @@ func TestFileLogStoreRetention(t *testing.T) {
 		kept = append(kept, e.Name())
 	}
 
-	assert.ElementsMatch(t, []string{day(0), day(-1), day(-2), day(1), day(7), "not-a-date"}, kept)
+	assert.ElementsMatch(t, []string{day(0), day(-1), day(-2), day(1), day(7), day(-5), "not-a-date"}, kept)
+	assert.FileExists(t, foreign)
+	assert.NoFileExists(t, filepath.Join(dir, day(-5), "7.log"))
 }
 
 func TestFileLogStoreReopenKeepsTheCap(t *testing.T) {
@@ -211,4 +244,20 @@ func TestFileLogStoreReopenKeepsTheCap(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.LessOrEqual(t, info.Size(), int64(DefaultFileLogRunBytes+200))
+}
+
+func TestFileLogStoreAfterClose(t *testing.T) {
+	// Scenario: a run that shutdown gave up waiting for keeps logging after the store was closed
+	// Expect: the write fails instead of reopening (and leaking) a file
+	s, err := NewFileLogStore(FileLogStoreConfig{Dir: t.TempDir()})
+	require.NoError(t, err)
+	ref := LogRef{LogID: 1, LogTime: time.Now()}
+	require.NoError(t, s.Close())
+
+	err = s.Write(ref, "late")
+
+	require.ErrorContains(t, err, "log store is closed")
+	assert.NoFileExists(t, s.path(ref))
+	_, err = NewFileLogStore(FileLogStoreConfig{Dir: t.TempDir(), MaxRunBytes: -1})
+	require.ErrorContains(t, err, "MaxRunBytes must not be negative")
 }

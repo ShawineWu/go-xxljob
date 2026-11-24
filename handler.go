@@ -22,7 +22,8 @@ var (
 	ErrHandlerChanged = sched.ErrHandlerChanged
 	// ErrTimeout means the run exceeded its timeout.
 	ErrTimeout = sched.ErrTimeout
-	// ErrShutdown means the executor is shutting down and stopped waiting for the run.
+	// ErrShutdown means the executor is shutting down: the cause of runs it stopped waiting for, of queued triggers it
+	// discarded, and the reason it gives for refusing triggers.
 	ErrShutdown = sched.ErrShutdown
 )
 
@@ -55,7 +56,8 @@ type Request struct {
 	Handler string
 	// Params are the job parameters configured in the admin (executorParams). Use BindJSON when they are JSON.
 	Params string
-	// BlockStrategy is the block strategy (one of the Block* constants).
+	// BlockStrategy is the block strategy, one of the Block* constants (BlockSerial when the admin sent none or an
+	// unknown one).
 	BlockStrategy string
 	// Timeout is the run timeout, 0 for none. When it expires the context is cancelled with ErrTimeout.
 	Timeout time.Duration
@@ -123,7 +125,7 @@ func HandleJSON[P any](fn func(ctx context.Context, req *Request, params P) erro
 	})
 }
 
-// Middleware wraps a Handler, e.g. for logging, tracing, metrics or rate limiting. The chain is built when a trigger
-// is accepted, outside the executor's locks: a middleware may call the Executor (Stats, ...). A middleware that
-// panics while building fails that trigger.
+// Middleware wraps a Handler, e.g. for logging, tracing, metrics or rate limiting. The chain is built when a run
+// starts, outside the executor's locks: a middleware may call the Executor (Stats, ...). A middleware that panics
+// while building fails that run, which is logged.
 type Middleware func(next Handler) Handler

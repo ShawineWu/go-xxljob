@@ -54,6 +54,14 @@ const (
 	CoverEarly   = "COVER_EARLY"
 )
 
+// NormalizeStrategy returns s if it is a block strategy, Serial otherwise (the admin may send none).
+func NormalizeStrategy(s string) string {
+	if s == DiscardLater || s == CoverEarly {
+		return s
+	}
+	return Serial
+}
+
 // Trigger is one trigger of a job.
 type Trigger struct {
 	JobID    int64
@@ -65,6 +73,9 @@ type Trigger struct {
 	// Run executes the trigger. It is called at most once, with a context that is cancelled with one of the causes
 	// above, and it must return (it may return after the trigger's outcome was already reported).
 	Run func(ctx context.Context) Result
+	// Done, if set, is called after Run has returned, on the same goroutine, with the outcome that was reported: the
+	// trigger's one decision, which may come from a cancellation rather than from what Run returned.
+	Done func(Outcome)
 }
 
 // Result is what a run produced: a failure with its message, or a success with an optional note. It is plain data,
@@ -194,6 +205,7 @@ type run struct {
 	cancel    context.CancelCauseFunc
 	phase     phase
 	reported  bool
+	outcome   Outcome       // the one reported; set with reported
 	delivered chan struct{} // closed once the Reporter has returned for this run
 }
 
@@ -284,7 +296,7 @@ func (s *Scheduler) settle(r *run, o Outcome) {
 		s.mu.Unlock()
 		return
 	}
-	r.reported = true
+	r.reported, r.outcome = true, o
 	switch o.Status {
 	case Succeeded:
 		s.stats.Succeeded++
@@ -483,6 +495,18 @@ func (s *Scheduler) execute(r *run) {
 	res := s.call(ctx, r.tr)
 	stopWatch()
 	s.settle(r, Classify(context.Cause(ctx), res))
+	if r.tr.Done != nil {
+		s.mu.Lock()
+		o := r.outcome
+		s.mu.Unlock()
+		s.done(r.tr, o)
+	}
+}
+
+// done calls the trigger's Done. A panic there is contained like one in Run: the run has been reported already.
+func (s *Scheduler) done(tr *Trigger, o Outcome) {
+	defer func() { _ = recover() }()
+	tr.Done(o)
 }
 
 // call runs the trigger. Run is not expected to panic; if it does anyway, the run fails instead of leaving its job

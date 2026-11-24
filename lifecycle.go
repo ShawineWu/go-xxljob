@@ -16,14 +16,13 @@ type state int
 const (
 	stateNew state = iota
 	stateRunning
-	stateClosing
-	stateClosed
+	stateClosing // shutting down or shut down: nothing is accepted any more
 )
 
 // errNotStarted rejects requests that arrive before Start.
 var errNotStarted = errors.New("executor is not started")
 
-// lifecycle owns the executor's state (new → running → closing → closed). Every check of the state goes through it.
+// lifecycle owns the executor's state (new → running → closing). Every check of the state goes through it.
 type lifecycle struct {
 	mu       sync.Mutex
 	state    state
@@ -77,15 +76,10 @@ func (l *lifecycle) beginShutdown() (started bool) {
 	return started
 }
 
-func (l *lifecycle) finish() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.state = stateClosed
-}
-
 // Start listens on the executor port (unless WithoutServer is set), then starts the registry heartbeat and the
 // result callbacks. It does not block. It listens before registering, so a port that is already taken fails Start
-// instead of registering an executor that cannot receive triggers. Start can be called only once.
+// instead of registering an executor that cannot receive triggers. Start succeeds at most once (it may be retried
+// after it failed), and never after Shutdown.
 func (e *Executor) Start() error {
 	if err := e.start(); err != nil {
 		return err
@@ -105,7 +99,7 @@ func (e *Executor) start() error {
 				return fmt.Errorf("xxljob: listen executor port %d: %w", e.cfg.Port, err)
 			}
 			e.server = &http.Server{
-				Handler:           e.Handler(),
+				Handler:           e.mux,
 				ReadHeaderTimeout: 5 * time.Second,
 				ReadTimeout:       10 * time.Second,
 				WriteTimeout:      30 * time.Second, // a log read of a long run
@@ -153,18 +147,19 @@ func (e *Executor) Run(ctx context.Context) error {
 // Shutdown stops the executor gracefully, following a time budget fixed when it begins (see shutdownPlan):
 //
 //  1. reject new triggers (beat and idleBeat fail too, so failover routing sends work elsewhere);
-//  2. stop the registry heartbeat, wait for the one in progress, and deregister: at most 2×RequestTimeout;
+//  2. stop the registry heartbeat, wait for the one in progress (at most RequestTimeout), and deregister (at most
+//     RequestTimeout);
 //  3. discard queued triggers and triggers waiting for a concurrency slot; wait for running jobs until ctx is done,
 //     then cancel them with ErrShutdown and wait at most CancelWait more;
 //  4. deliver the remaining results until CancelWait from here, or ctx's deadline if later; the request in progress
-//     is not cut short (the admin may already have processed it), and one more is always attempted, each at most
-//     RequestTimeout; with CallbackDir set, results still undelivered are saved for the next process, otherwise they
-//     are logged as lost;
+//     is not cut short (the admin may already have processed it), and one more is always attempted, so this step
+//     takes at most max(CancelWait, RequestTimeout) + RequestTimeout past that; with CallbackDir set, results still
+//     undelivered are saved for the next process, otherwise they are logged as lost;
 //  5. close the executor port (last, so the admin can still kill jobs while waiting): at most 1s; close the log store.
 //
-// With one admin address, it returns at most 3×RequestTimeout + CancelWait + max(CancelWait, RequestTimeout) + 1s
-// after ctx's deadline, and RequestTimeout + 2×CancelWait + 1s when the deadline leaves time for step 2 (each
-// further address can add a RequestTimeout to every request that fails over). Without a deadline it waits for running
+// With one admin address, it returns at most CancelWait + max(CancelWait, RequestTimeout) + RequestTimeout + 1s
+// after ctx's deadline when that deadline leaves time for step 2 (10s with the defaults), and 2×RequestTimeout more
+// otherwise; each further address can add a RequestTimeout to every request that fails over. Without a deadline it waits for running
 // jobs indefinitely; every other step stays bounded. It returns ctx's error if running jobs had to be cancelled.
 // Repeated and concurrent calls wait for the first one and return its result.
 func (e *Executor) Shutdown(ctx context.Context) error {
@@ -196,7 +191,6 @@ func (e *Executor) shutdown(plan shutdownPlan) error {
 	if cerr := closeLogs(e.logs); cerr != nil {
 		e.log.Error("xxljob: close log store", "err", cerr)
 	}
-	e.life.finish()
 	e.log.Info("xxljob: executor stopped", "app_name", e.cfg.AppName)
 	return err
 }
@@ -227,11 +221,11 @@ func newShutdownPlan(ctx context.Context, cfg Config) shutdownPlan {
 	return shutdownPlan{jobs: ctx, cancelWait: cfg.CancelWait, request: cfg.RequestTimeout, flush: cfg.CancelWait}
 }
 
-// deregister bounds the deregistration: the heartbeat in progress, then the deregistration request. It does not
-// depend on the caller's context, which may already be done: telling the admin to stop routing here matters most
-// when time is short.
+// deregister bounds the wait for the heartbeat in progress; the deregistration request that follows is bounded by
+// its own timeout. Neither depends on the caller's context, which may already be done: telling the admin to stop
+// routing here matters most when time is short.
 func (p shutdownPlan) deregister() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), 2*p.request)
+	return context.WithTimeout(context.Background(), p.request)
 }
 
 // callbacks bounds the delivery of the last results: at least flush, or until the caller's deadline if that is

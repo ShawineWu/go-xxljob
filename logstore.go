@@ -62,7 +62,8 @@ const logEntryOverhead = 64
 
 // MemoryLogStore keeps recent execution logs in memory, up to a total size. When it is full the oldest logs are
 // evicted, those of finished runs first. A single run may use at most an eighth of the total; further lines are
-// dropped and counted in a note at the end of its log. Logs are lost on restart.
+// dropped and counted in a note at the end of its log. Logs are lost on restart. Create it with NewMemoryLogStore:
+// the zero value is not usable.
 type MemoryLogStore struct {
 	maxBytes, maxRunBytes int
 
@@ -70,6 +71,7 @@ type MemoryLogStore struct {
 	runs    map[int64]*list.Element // of *memoryLog, in running or ended
 	running list.List               // oldest first
 	ended   list.List               // oldest first
+	evicted map[int64]struct{}      // running runs whose log was evicted: their further lines are dropped
 	size    int
 }
 
@@ -86,7 +88,8 @@ func NewMemoryLogStore(maxBytes int) *MemoryLogStore {
 	if maxBytes <= 0 {
 		maxBytes = DefaultMemoryLogBytes
 	}
-	return &MemoryLogStore{maxBytes: maxBytes, maxRunBytes: max(maxBytes/8, logEntryOverhead+1), runs: map[int64]*list.Element{}}
+	return &MemoryLogStore{maxBytes: maxBytes, maxRunBytes: max(maxBytes/8, logEntryOverhead+1), runs: map[int64]*list.Element{},
+		evicted: map[int64]struct{}{}}
 }
 
 // Write implements LogStore.
@@ -112,6 +115,7 @@ func (s *MemoryLogStore) Write(ref LogRef, line string) error {
 func (s *MemoryLogStore) End(ref LogRef) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	delete(s.evicted, ref.LogID)
 	e := s.runs[ref.LogID]
 	if e == nil {
 		return nil
@@ -149,10 +153,14 @@ func (s *MemoryLogStore) Read(ref LogRef, fromLine int) (LogChunk, error) {
 // Close implements LogStore.
 func (s *MemoryLogStore) Close() error { return nil }
 
-// entry returns the log of id, creating it (and making room for it) if needed. Called with s.mu held.
+// entry returns the log of id, creating it (and making room for it) if needed. A run whose log was evicted while it
+// was running gets none: a new log would show only its last lines, numbered from 1. Called with s.mu held.
 func (s *MemoryLogStore) entry(id int64) *memoryLog {
 	if e := s.runs[id]; e != nil {
 		return e.Value.(*memoryLog)
+	}
+	if _, gone := s.evicted[id]; gone {
+		return nil
 	}
 	if !s.makeRoom(logEntryOverhead, id) {
 		return nil
@@ -181,6 +189,7 @@ func (s *MemoryLogStore) makeRoom(n int, keep int64) bool {
 			s.ended.Remove(victim)
 		} else {
 			s.running.Remove(victim)
+			s.evicted[l.id] = struct{}{}
 		}
 		delete(s.runs, l.id)
 		s.size -= l.size
@@ -206,7 +215,7 @@ func chunkOf(lines []string, fromLine int) LogChunk {
 // DefaultFileLogRunBytes caps the execution log of a single run in FileLogStore.
 const DefaultFileLogRunBytes = 16 << 20
 
-// FileLogStoreConfig configures NewFileLogStore.
+// FileLogStoreConfig configures NewFileLogStore. Negative values are rejected.
 type FileLogStoreConfig struct {
 	// Dir is the root directory. Required.
 	Dir string
@@ -218,14 +227,16 @@ type FileLogStoreConfig struct {
 
 // FileLogStore writes logs to {Dir}/{yyyy-MM-dd}/{logId}.log, dated by the trigger's log time in the local time
 // zone, like the official executor. A run's log is capped at MaxRunBytes; further lines are dropped and counted in a
-// note at the end. A background goroutine removes date directories older than the retention period every hour.
+// note at the end. A background goroutine removes the logs of days outside the retention period every hour. Create
+// it with NewFileLogStore: the zero value is not usable.
 type FileLogStore struct {
 	dir         string
 	retention   int
 	maxRunBytes int
 
-	mu   sync.Mutex
-	open map[int64]*openLog // logs of running jobs
+	mu     sync.Mutex
+	open   map[int64]*openLog // logs of running jobs
+	closed bool
 
 	stop chan struct{}
 	done chan struct{}
@@ -245,11 +256,14 @@ func NewFileLogStore(cfg FileLogStoreConfig) (*FileLogStore, error) {
 	if cfg.Dir == "" {
 		return nil, errors.New("xxljob: log dir is required")
 	}
+	if cfg.MaxRunBytes < 0 {
+		return nil, errors.New("xxljob: MaxRunBytes must not be negative")
+	}
 	if err := os.MkdirAll(cfg.Dir, 0o750); err != nil {
 		return nil, fmt.Errorf("xxljob: create log dir: %w", err)
 	}
 	s := &FileLogStore{dir: cfg.Dir, retention: cfg.RetentionDays, open: map[int64]*openLog{},
-		maxRunBytes: cmp.Or(max(cfg.MaxRunBytes, 0), DefaultFileLogRunBytes),
+		maxRunBytes: cmp.Or(cfg.MaxRunBytes, DefaultFileLogRunBytes),
 		stop:        make(chan struct{}), done: make(chan struct{})}
 	go s.cleanLoop()
 	return s, nil
@@ -285,6 +299,10 @@ func (s *FileLogStore) get(ref LogRef) (*openLog, error) {
 	defer s.mu.Unlock()
 	if l := s.open[ref.LogID]; l != nil {
 		return l, nil
+	}
+	if s.closed {
+		// A run that shutdown gave up waiting for may still log: it must not reopen files after Close.
+		return nil, errors.New("xxljob: log store is closed")
 	}
 	p := s.path(ref)
 	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
@@ -370,7 +388,7 @@ func (s *FileLogStore) Close() error {
 	<-s.done
 	s.mu.Lock()
 	open := s.open
-	s.open = map[int64]*openLog{}
+	s.open, s.closed = map[int64]*openLog{}, true
 	s.mu.Unlock()
 	var errs []error
 	for _, l := range open {
@@ -397,9 +415,10 @@ func (s *FileLogStore) cleanLoop() {
 	}
 }
 
-// clean removes date directories outside the retention window: older than retention days (today counting as the
-// first), or further in the future than the clock skew a trigger may have (maxClockSkew) and a day. Other
-// directories are left alone.
+// clean removes the logs in date directories outside the retention window: older than retention days (today
+// counting as the first), or further in the future than the clock skew a trigger may have (maxClockSkew) and a day.
+// Only files named like this store's logs ({logId}.log) are removed, then the directory if that left it empty; other
+// files and directories are left alone.
 func (s *FileLogStore) clean(now time.Time) {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
@@ -413,6 +432,21 @@ func (s *FileLogStore) clean(now time.Time) {
 		if err != nil || !e.IsDir() || (!day.Before(oldest) && !day.After(newest)) {
 			continue
 		}
-		_ = os.RemoveAll(filepath.Join(s.dir, e.Name()))
+		s.removeLogs(filepath.Join(s.dir, e.Name()))
 	}
+}
+
+// removeLogs removes the log files in a date directory, and the directory once it is empty.
+func (s *FileLogStore) removeLogs(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		id, ok := strings.CutSuffix(e.Name(), ".log")
+		if _, err := strconv.ParseInt(id, 10, 64); ok && err == nil && e.Type().IsRegular() {
+			_ = os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
+	_ = os.Remove(dir) // fails if anything else is left
 }

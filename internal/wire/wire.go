@@ -36,6 +36,9 @@ const (
 	appNameHeader = "XXL-JOB-APPNAME"
 )
 
+// ContentType is the content type of every body exchanged with the admin.
+const ContentType = "application/json;charset=UTF-8"
+
 // Paths the admin calls on the executor, besides the run path, which depends on the version (Protocol.RunPath).
 const (
 	PathKill     = "/kill"
@@ -73,7 +76,7 @@ func DecodeAdminReply(data []byte) error {
 		return fmt.Errorf("invalid response %.200q: %w", data, err)
 	}
 	if rt.Code != CodeSuccess {
-		return fmt.Errorf("code %d: %s", rt.Code, rt.Msg)
+		return fmt.Errorf("code %d: %.200s", rt.Code, rt.Msg)
 	}
 	return nil
 }
@@ -154,6 +157,13 @@ type Reply struct {
 	Payload any // LogResult for /log
 }
 
+// LogNotice is a /log reply that shows text in the admin's log viewer in place of a log. The viewer shows content
+// only when toLineNum >= fromLineNum, and stops asking at isEnd.
+func LogNotice(fromLine int, text string) Reply {
+	from := max(fromLine, 1)
+	return Reply{Code: CodeSuccess, Payload: LogResult{FromLineNum: from, ToLineNum: from, IsEnd: true, LogContent: text}}
+}
+
 // OK is a successful reply.
 func OK() Reply { return Reply{Code: CodeSuccess} }
 
@@ -185,7 +195,7 @@ func NewRegistryParam(appName, address string) RegistryParam {
 // MaxResultMsg caps the result message reported to the admin, in runes, like the official executor.
 const MaxResultMsg = 50000
 
-// TruncateMsg shortens msg to MaxResultMsg runes.
+// TruncateMsg keeps the first MaxResultMsg runes of msg, followed by "..." when it cut anything.
 func TruncateMsg(msg string) string {
 	if len(msg) <= MaxResultMsg { // bytes >= runes, so it already fits
 		return msg

@@ -138,6 +138,21 @@ func TestNotFound(t *testing.T) {
 	assert.Equal(t, "invalid request, uri-mapping(/trigger) not found. (this executor serves /run: check Config.AdminVersion)", r.Msg)
 }
 
+func TestDecodeAdminReply(t *testing.T) {
+	// Scenario: the admin answers success, a failure with a huge message, and something that is not JSON
+	// Expect: nil; an error whose message is cut to 200 bytes; an error
+	long := strings.Repeat("A", 100_000)
+
+	ok := DecodeAdminReply([]byte(`{"code":200}`))
+	failed := DecodeAdminReply([]byte(`{"code":500,"msg":"` + long + `"}`))
+	invalid := DecodeAdminReply([]byte(`<html>`))
+
+	require.NoError(t, ok)
+	require.Error(t, failed)
+	assert.Equal(t, "code 500: "+long[:200], failed.Error())
+	require.Error(t, invalid)
+}
+
 func TestTruncateMsg(t *testing.T) {
 	// Scenario: result messages are capped like the official executor (50000 characters, then "...")
 	// Expect: short messages are unchanged; long ones keep exactly MaxResultMsg runes and stay valid UTF-8

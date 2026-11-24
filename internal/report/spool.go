@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/ShawineWu/go-xxljob/internal/wire"
@@ -21,7 +23,8 @@ const (
 	spoolPrefix  = "callback-"
 	spoolExt     = ".jsonl"   // saved, waiting to be loaded
 	claimedExt   = ".claimed" // loaded, removed once its results are delivered or saved again
-	badExt       = ".bad"     // could not be read; kept for inspection
+	badExt       = ".bad"     // could not be read; kept for inspection, outside the size limit
+	tmpExt       = ".tmp"     // being written
 	maxSpoolLine = 1 << 20    // longer lines are not results this package wrote
 )
 
@@ -82,7 +85,7 @@ func (s *spool) save(results []wire.Result) (err error) {
 		}
 	}
 	name := fmt.Sprintf("%s%d-%d-%d", spoolPrefix, time.Now().UnixNano(), os.Getpid(), s.seq.Add(1))
-	tmp := filepath.Join(s.dir, name+".tmp")
+	tmp := filepath.Join(s.dir, name+tmpExt)
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600) //nolint:gosec // G304: name built here
 	if err != nil {
 		return err
@@ -99,8 +102,8 @@ func (s *spool) save(results []wire.Result) (err error) {
 	return nil
 }
 
-// adopt makes the files claimed by a process that stopped without releasing them available to claim again. Call it
-// before the first claim.
+// adopt makes the files claimed by a process that stopped without releasing them available to claim again, and
+// removes the temporary files of saves it did not finish. Call it before the first claim.
 func (s *spool) adopt() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -110,9 +113,16 @@ func (s *spool) adopt() error {
 	}
 	var errs []error
 	for _, e := range entries {
-		if name := e.Name(); e.Type().IsRegular() && strings.HasPrefix(name, spoolPrefix) && strings.HasSuffix(name, claimedExt) {
-			path := filepath.Join(s.dir, name)
+		name := e.Name()
+		if !e.Type().IsRegular() || !strings.HasPrefix(name, spoolPrefix) {
+			continue
+		}
+		path := filepath.Join(s.dir, name)
+		switch {
+		case strings.HasSuffix(name, claimedExt):
 			errs = append(errs, os.Rename(path, strings.TrimSuffix(path, claimedExt)+spoolExt))
+		case strings.HasSuffix(name, tmpExt):
+			errs = append(errs, os.Remove(path))
 		}
 	}
 	return errors.Join(errs...)
@@ -179,7 +189,7 @@ func (s *spool) release() error {
 	return errors.Join(errs...)
 }
 
-// used is the size of the saved and claimed files.
+// used is the size of the files that count against maxBytes: all but the bad ones, which hold nothing loadable.
 func (s *spool) used() (int64, error) {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
@@ -187,7 +197,7 @@ func (s *spool) used() (int64, error) {
 	}
 	var n int64
 	for _, e := range entries {
-		if !e.Type().IsRegular() || !strings.HasPrefix(e.Name(), spoolPrefix) {
+		if !e.Type().IsRegular() || !strings.HasPrefix(e.Name(), spoolPrefix) || strings.HasSuffix(e.Name(), badExt) {
 			continue
 		}
 		if info, err := e.Info(); err == nil {
@@ -197,39 +207,65 @@ func (s *spool) used() (int64, error) {
 	return n, nil
 }
 
-// readSpoolFile reads the results in a file, skipping and counting the lines that are not results. A file larger
-// than maxBytes (when set) is an error: this package never writes one.
+// readSpoolFile reads the results in a file, skipping and counting the lines that are not results. It reads only a
+// regular file: opening does not block (a FIFO swapped in after the directory was listed), and the file is checked
+// after opening (a symlink). A file larger than maxBytes (when set) is an error: this package never writes one.
+// Messages are cut to the length the admin accepts.
 func readSpoolFile(path string, maxBytes int64) (out []wire.Result, skipped int, err error) {
-	f, err := os.Open(path) //nolint:gosec // G304: a regular file of our own spool directory
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0) //nolint:gosec // G304: a file of our own spool directory
 	if err != nil {
 		return nil, 0, err
 	}
 	defer func() { _ = f.Close() }()
-	if maxBytes > 0 {
-		info, err := f.Stat()
-		if err != nil {
+	info, err := f.Stat()
+	if err != nil {
+		return nil, 0, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, 0, errors.New("not a regular file")
+	}
+	if lst, err := os.Lstat(path); err != nil || !lst.Mode().IsRegular() {
+		return nil, 0, errors.New("not a regular file (a symlink?)")
+	}
+	if maxBytes > 0 && info.Size() > maxBytes {
+		return nil, 0, fmt.Errorf("file is %d bytes, over the %d byte limit", info.Size(), maxBytes)
+	}
+	br := bufio.NewReader(f)
+	for {
+		line, tooLong, err := readLine(br, maxSpoolLine)
+		if errors.Is(err, io.EOF) && len(line) == 0 && !tooLong {
+			break
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
 			return nil, 0, err
 		}
-		if info.Size() > maxBytes {
-			return nil, 0, fmt.Errorf("file is %d bytes, over the %d byte limit", info.Size(), maxBytes)
-		}
-	}
-	sc := bufio.NewScanner(f)
-	sc.Buffer(nil, maxSpoolLine)
-	for sc.Scan() {
-		line := bytes.TrimSpace(sc.Bytes())
-		if len(line) == 0 {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 && !tooLong {
 			continue
 		}
 		var r record
-		if json.Unmarshal(line, &r) != nil || r.LogID <= 0 {
+		if tooLong || json.Unmarshal(line, &r) != nil || r.LogID <= 0 {
 			skipped++
 			continue
 		}
-		out = append(out, wire.Result{LogID: r.LogID, LogTime: r.LogTime, Code: r.Code, Msg: r.Msg})
-	}
-	if err := sc.Err(); err != nil {
-		return nil, 0, err
+		out = append(out, wire.Result{LogID: r.LogID, LogTime: r.LogTime, Code: r.Code, Msg: wire.TruncateMsg(r.Msg)})
 	}
 	return out, skipped, nil
+}
+
+// readLine reads a line of at most limit bytes. A longer one is consumed but not returned (tooLong).
+func readLine(br *bufio.Reader, limit int) (line []byte, tooLong bool, err error) {
+	for {
+		frag, err := br.ReadSlice('\n')
+		if !tooLong {
+			if len(line)+len(frag) > limit {
+				tooLong, line = true, nil
+			} else {
+				line = append(line, frag...)
+			}
+		}
+		if !errors.Is(err, bufio.ErrBufferFull) {
+			return line, tooLong, err
+		}
+	}
 }

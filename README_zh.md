@@ -17,7 +17,7 @@ XXL-JOB 是广泛使用的分布式任务调度平台：**调度中心**决定�
 - **一切有界**：准入、队列、日志、回调都有上限，关停有时间预算，见[资源上限](#资源上限)。
 - **功能完整**：终止、超时、调度中心可查看的执行日志、分片广播、结果回调失败重试（可选跨重启保留）、优雅退出、OpenTelemetry（[`otelxxljob`](#链路追踪与指标opentelemetry)）。
 - **易于测试**：`xxljob.Invoke` 不需要调度中心，按真实执行的方式跑一次任务。
-- **零依赖**：只依赖 Go 标准库（OpenTelemetry 集成是独立的模块）。
+- **零运行时依赖**：只依赖 Go 标准库（testify 只用于测试；OpenTelemetry 集成是独立的模块）。
 
 ## 目录
 
@@ -210,15 +210,14 @@ XXL-JOB 3.5.0 修改了执行器协议，与旧版本不兼容，所以要按调
 |---|---|---|
 | `WithLogger(*slog.Logger)` | `slog.Default()` | 执行器自身日志，以及任务日志的应用日志部分 |
 | `WithLogStore(LogStore)` | 内存，16 MiB | 执行日志的存储 |
-| `WithMiddleware(...)` | 无 | 对所有任务生效的中间件 |
 | `WithHTTPClient(*http.Client)` | `&http.Client{}` | 访问调度中心的 HTTP 客户端（会被复制，且不跟随重定向） |
-| `WithoutServer()` | 关 | 不监听端口，在启动前自行挂载 `exec.Handler()` |
+| `WithoutServer()` | 关 | 不监听端口，在启动前自行挂载 `exec.HTTPHandler()`（必须设置 `Address`） |
 
 ## 部署
 
 ### 优雅退出
 
-`Run` 的 ctx 结束时（或调用 `Shutdown(ctx)` 时），执行器会拒绝新的调度、注销、最多等执行中的任务 `ShutdownTimeout`（或直到 `ctx` 超时）、取消剩下的任务，并发出剩余的结果。每一步都有上限：只有一个调度中心地址时，关停最多耗时 `ShutdownTimeout + RequestTimeout + 2×CancelWait + 1s`（`RequestTimeout ≤ CancelWait` 且 `ShutdownTimeout ≥ 2×RequestTimeout` 时），默认配置下是 25 秒，在 Kubernetes 默认的 30 秒 `terminationGracePeriodSeconds` 之内。如果为了长任务调大了 `ShutdownTimeout`，宽限期也要相应调大。
+`Run` 的 ctx 结束时（或调用 `Shutdown(ctx)` 时），执行器会拒绝新的调度、注销、最多等执行中的任务 `ShutdownTimeout`（或直到 `ctx` 超时）、取消剩下的任务，并发出剩余的结果。每一步都有上限：只有一个调度中心地址时，关停最多耗时 `ShutdownTimeout + CancelWait + max(CancelWait, RequestTimeout) + RequestTimeout + 1s`（`ShutdownTimeout ≥ 2×RequestTimeout` 时），默认配置下是 25 秒，在 Kubernetes 默认的 30 秒 `terminationGracePeriodSeconds` 之内。如果为了长任务调大了 `ShutdownTimeout`，宽限期也要相应调大。
 
 ### 跨重启保留结果
 
@@ -251,7 +250,8 @@ env:
 | 同时执行的 handler | 设置了 `MaxConcurrency` 时受其限制 |
 | 内存中的执行日志 | 16 MiB（`NewMemoryLogStore`），单次执行最多占 1/8，优先淘汰最早结束的执行 |
 | 磁盘上的执行日志 | 单次执行 16 MiB（`FileLogStore`），按保留期清理；每个执行中的任务打开一个文件 |
-| 待发送的结果 | `MaxPendingCallbacks` 且不超过 64 MiB；超出部分写入 `CallbackDir`，或丢弃并记日志 |
+| 读取执行日志 | 同时最多处理 4 个 `/log` 请求，其余排队等待 |
+| 待发送的结果 | `MaxPendingCallbacks` 且不超过 64 MiB；超出部分写入 `CallbackDir`（最多 512 MiB），或丢弃并记日志 |
 | 关停时间 | 见[优雅退出](#优雅退出) |
 
 ## 进阶用法
@@ -271,7 +271,7 @@ exec.Use(func(next xxljob.Handler) xxljob.Handler {
 })
 ```
 
-只对某个任务生效的中间件，放在 `Register(name, handler, middlewares...)` 的参数里。中间件链在调度被受理时组装，所以 `Use` 只对之后受理的调度生效。调用链深处的代码可以用 `xxljob.RequestFrom(ctx)` 取到当前调度。
+只对某个任务生效的中间件，放在 `Register(name, handler, middlewares...)` 的参数里。中间件链在每次执行开始时组装，所以 `Use` 对之后开始的执行生效，包括已经在排队的调度。调用链深处的代码可以用 `xxljob.RequestFrom(ctx)` 取到当前调度。
 
 ### 链路追踪与指标（OpenTelemetry）
 
@@ -321,7 +321,7 @@ exec, _ := xxljob.New(xxljob.Config{
 	// ...
 	Address: "http://10.0.0.8:8080/xxl-job/", // 调度中心访问本执行器的完整地址
 }, xxljob.WithoutServer())
-mux.Handle("/xxl-job/", http.StripPrefix("/xxl-job", exec.Handler())) // 在启动前挂载
+mux.Handle("/xxl-job/", http.StripPrefix("/xxl-job", exec.HTTPHandler())) // 在启动前挂载
 go server.ListenAndServe()
 err := exec.Run(ctx) // 注册和回调；调度中心的请求由你的 HTTP 服务处理
 ```
@@ -367,9 +367,9 @@ err := exec.Run(ctx) // 注册和回调；调度中心的请求由你的 HTTP �
 `Shutdown(ctx)` 按开始时确定的时间计划执行：
 
 1. 拒绝新的调度（存活检测也返回失败，故障转移路由会把调度改派给其他实例）；
-2. 停止心跳，等正在进行的心跳结束，再注销（最多 `2×RequestTimeout`）；
+2. 停止心跳，等正在进行的心跳结束，再注销（各最多 `RequestTimeout`）；
 3. 丢弃排队中和等待并发空位的调度；等执行中的任务结束直到 `ctx` 超时，然后取消任务，最多再等 `CancelWait`；
-4. 发送剩余的结果（至少 `CancelWait`，且总会再尝试一次）；剩下的写入 `CallbackDir`（最多 512 MiB），或记为丢失；
+4. 发送剩余的结果（至少 `CancelWait`，另加进行中的请求和最后一次尝试）；剩下的写入 `CallbackDir`（最多 512 MiB），或记为丢失；
 5. 最后关闭执行器端口，等待期间调度中心仍可终止任务。
 
 ### 协议版本
@@ -399,7 +399,7 @@ make stress     # 重复跑并发压力测试
 make bench      # 基准测试
 ```
 
-- **调度层测试**在虚拟时钟（`testing/synctest`）上运行：超时、终止、覆盖、关停都在精确的时刻检查，不依赖 sleep，也不会偶发失败。
+- **调度层测试**大多在虚拟时钟（`testing/synctest`）上运行：超时、终止、覆盖、关停都在精确的时刻检查，不依赖 sleep，也不会偶发失败。
 - **单元测试**用模拟的调度中心覆盖协议、HTTP 接口、回调（故障转移、重试、上限、落盘）、日志存储和生命周期。
 - **压力测试**对许多任务并发执行数百个随机操作，检查不变量：每个被受理的调度恰好回调一次、被拒绝的没有回调、同一任务从不并发、并发上限成立、计数平衡、没有泄漏的 goroutine。失败时可用日志里的种子复现：`XXLJOB_STRESS_SEED=<种子> go test -run TestMultiJobStress .`
 - **模糊测试**向两种协议的每个接口发送任意请求，并用任意日志测试日志相关代码。

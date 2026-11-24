@@ -50,7 +50,7 @@ func FuzzHandler(f *testing.F) {
 			}
 			rec := httptest.NewRecorder()
 
-			e.Handler().ServeHTTP(rec, req)
+			e.HTTPHandler().ServeHTTP(rec, req)
 
 			var res struct {
 				Code *int `json:"code"`

@@ -10,10 +10,10 @@ import (
 	"github.com/ShawineWu/go-xxljob/internal/wire"
 )
 
-// Result is the outcome of Invoke.
-type Result struct {
-	// Err is the error returned by the handler (including a recovered panic, or the cancellation cause); nil on
-	// success.
+// InvokeResult is the outcome of Invoke.
+type InvokeResult struct {
+	// Err is why the run failed: the cancellation cause (such as ErrTimeout) when the run was cancelled, whatever the
+	// handler returned; otherwise the handler's error, including a recovered panic. nil on success.
 	Err error
 	// Code is the code the executor would report to the admin: CodeSuccess, CodeFailure or CodeTimeout.
 	Code int
@@ -30,7 +30,7 @@ type Result struct {
 //
 //	res := xxljob.Invoke(ctx, NewSyncTask(db), &xxljob.Request{Params: `{"batchSize":10}`})
 //	if res.Err != nil { ... }
-func Invoke(ctx context.Context, h Handler, req *Request) Result {
+func Invoke(ctx context.Context, h Handler, req *Request) InvokeResult {
 	var r Request
 	if req != nil {
 		r = *req
@@ -49,12 +49,14 @@ func Invoke(ctx context.Context, h Handler, req *Request) Result {
 	}
 	store := NewMemoryLogStore(0)
 	ref := LogRef{LogID: r.LogID, LogTime: r.LogTime}
-	run, err := runner{store: store, app: slog.Default()}.run(ctx, h, r, ref)
-	o := sched.Classify(context.Cause(ctx), run)
-	if err == nil && o.Status != sched.Succeeded {
-		err = context.Cause(ctx) // cancelled: the handler's nil does not count
+	run, finish, err := runner{store: store, app: slog.Default()}.run(ctx, h, r, ref)
+	cause := context.Cause(ctx)
+	o := sched.Classify(cause, run)
+	finish(o)
+	if sched.IsCause(cause) {
+		err = cause // the cancellation decided the outcome, whatever the handler returned
 	}
-	res := Result{Err: err, Code: codeOf(o.Status), Msg: wire.TruncateMsg(o.Msg)}
+	res := InvokeResult{Err: err, Code: codeOf(o.Status), Msg: wire.TruncateMsg(o.Msg)}
 	if chunk, rerr := store.Read(ref, 1); rerr == nil && chunk.Content != "" {
 		res.Log = strings.Split(strings.TrimSuffix(chunk.Content, "\n"), "\n")
 	}

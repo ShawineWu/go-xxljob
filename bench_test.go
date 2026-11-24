@@ -15,7 +15,7 @@ import (
 // validation, block strategy, queueing), spread over 64 jobs. Runs and callbacks happen in the background.
 func BenchmarkTrigger(b *testing.B) {
 	h := newHarness(b, map[string]Handler{"T": HandlerFunc(noop)}, func(c *Config) { c.MaxActiveTriggers = 1 << 20 })
-	handler := h.e.Handler()
+	handler := h.e.HTTPHandler()
 	now := time.Now().UnixMilli()
 	var logID int64
 	b.ReportAllocs()

@@ -216,11 +216,11 @@ func TestInstrument(t *testing.T) {
 		_ = exec.Shutdown(ctx)
 	})
 
-	trigger(t, exec.Handler(), 1, 1, "Ok")
-	trigger(t, exec.Handler(), 2, 2, "Fail")
-	trigger(t, exec.Handler(), 3, 3, "Missing")
-	trigger(t, exec.Handler(), 4, 4, "Block")
-	trigger(t, exec.Handler(), 4, 5, "Block")
+	trigger(t, exec.HTTPHandler(), 1, 1, "Ok")
+	trigger(t, exec.HTTPHandler(), 2, 2, "Fail")
+	trigger(t, exec.HTTPHandler(), 3, 3, "Missing")
+	trigger(t, exec.HTTPHandler(), 4, 4, "Block")
+	trigger(t, exec.HTTPHandler(), 4, 5, "Block")
 	require.Eventually(t, func() bool {
 		st := exec.Stats()
 		return st.Registered && st.Succeeded+st.Failed == 2 && st.PendingCallbacks == 0 && st.Queued == 1

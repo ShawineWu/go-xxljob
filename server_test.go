@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -155,9 +156,11 @@ func TestKillBeatAndIdleBeat(t *testing.T) {
 
 func TestTimeoutReportedAtDeadline(t *testing.T) {
 	// Scenario: a job with a 1s timeout whose handler ignores its context for 1.5s and then returns nil
-	// Expect: the admin gets 502 at the deadline, not success when the handler finally returns
+	// Expect: the admin gets 502 while the handler is still running (at the deadline), not success when it returns
+	var returned atomic.Bool
 	h := newHarness(t, map[string]Handler{"Stubborn": HandlerFunc(func(context.Context, *Request) error {
 		time.Sleep(1500 * time.Millisecond)
+		returned.Store(true)
 		return nil
 	})})
 
@@ -165,9 +168,10 @@ func TestTimeoutReportedAtDeadline(t *testing.T) {
 	h.run(t, trigger{JobID: 1, LogID: 1, ExecutorHandler: "Stubborn", ExecutorTimeout: 1})
 	cb := h.admin.callback(t, 1)
 
+	assert.False(t, returned.Load(), "reported before the handler returned")
+	assert.GreaterOrEqual(t, time.Since(start), time.Second)
 	assert.Equal(t, CodeTimeout, cb.Code)
 	assert.Equal(t, ErrTimeout.Error(), cb.Msg)
-	assert.Less(t, time.Since(start), 1400*time.Millisecond)
 }
 
 func TestExecutionLog(t *testing.T) {
@@ -236,7 +240,7 @@ func TestBeatFollowsTheLifecycle(t *testing.T) {
 	e, err := New(testConfig(admin.srv.URL), WithoutServer(), WithLogger(quiet))
 	require.NoError(t, err)
 	require.NoError(t, e.Register("T", HandlerFunc(noop)))
-	srv := httptest.NewServer(e.Handler())
+	srv := httptest.NewServer(e.HTTPHandler())
 	defer srv.Close()
 	h := &harness{e: e, admin: admin, srv: srv}
 	probe := func() (beat, run reply) {

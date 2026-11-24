@@ -165,7 +165,7 @@ func startHarness(t testing.TB, admin *fakeAdmin, cfg Config, handlers map[strin
 	for name, h := range handlers {
 		require.NoError(t, e.Register(name, h))
 	}
-	srv := httptest.NewServer(e.Handler())
+	srv := httptest.NewServer(e.HTTPHandler())
 	require.NoError(t, e.Start())
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

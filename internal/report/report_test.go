@@ -486,8 +486,8 @@ func TestRegistry(t *testing.T) {
 
 func TestRegistryCloseIsBounded(t *testing.T) {
 	// Scenario: Close while a heartbeat request hangs (1s request timeout), with a 200ms context
-	// Expect: Close returns when its context is done instead of waiting for the heartbeat or the deregistration to
-	//         time out
+	// Expect: Close stops waiting for the heartbeat when its context is done, and still sends the deregistration,
+	//         bounded by the request timeout
 	a := newAdmin(t)
 	a.hang.Store(true)
 	r := NewRegistry(NewClient([]string{a.srv.URL}, v2(t, ""), nil, time.Second), quiet, "app", "http://x/", time.Hour)
@@ -499,7 +499,8 @@ func TestRegistryCloseIsBounded(t *testing.T) {
 	start := time.Now()
 	r.Close(ctx)
 
-	assert.Less(t, time.Since(start), 600*time.Millisecond)
+	assert.Less(t, time.Since(start), 1600*time.Millisecond)
+	assert.Equal(t, 1, a.count("/api/registryRemove"))
 }
 
 func TestRegistryDeregistersAfterTheHeartbeat(t *testing.T) {
@@ -529,4 +530,89 @@ func TestRegistryDeregistersAfterTheHeartbeat(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	assert.Equal(t, []string{"/api/registry", "/api/registryRemove"}, order)
+}
+
+func TestCallbacksCloseStopsTheSender(t *testing.T) {
+	// Scenario: Close with no time left while a callback request hangs and the sender is woken every 5ms
+	// Expect: after the request in progress, Close makes exactly one more attempt; the sender does not start others
+	//         (select picks at random among ready cases, so it must check for Close itself)
+	const timeout = 200 * time.Millisecond
+	for range 10 {
+		a := newAdmin(t)
+		a.hang.Store(true)
+		c, err := NewCallbacks(NewClient([]string{a.srv.URL}, v2(t, ""), nil, timeout), quiet,
+			CallbackConfig{RetryInterval: 5 * time.Millisecond, MaxPending: 100, MaxBytes: 1 << 20})
+		require.NoError(t, err)
+		c.Start()
+		c.Push(wire.Result{LogID: 1})
+		require.Eventually(t, func() bool { return a.hits.Load() > 0 }, time.Second, time.Millisecond)
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		before, start := a.hits.Load(), time.Now()
+
+		c.Close(ctx)
+
+		assert.LessOrEqual(t, a.hits.Load()-before, int32(1))
+		assert.Less(t, time.Since(start), 5*timeout, "two requests of 200ms, with slack for a loaded machine")
+	}
+}
+
+func TestCallbacksKeepClaimedFilesUntilOverflowIsSaved(t *testing.T) {
+	// Scenario: results loaded from a saved file overflow the queue; before the overflow is saved, the sender empties
+	//           the queue; then saving the overflow fails
+	// Expect: the claimed file is not removed while the overflow is unsaved, nor after the save failed, so the
+	//         overflowing results stay on disk instead of being lost
+	dir := t.TempDir()
+	sp, err := newSpool(dir, 0)
+	require.NoError(t, err)
+	require.NoError(t, sp.save(results(1, 5)))
+	a := newAdmin(t)
+	c := callbacks(t, a, CallbackConfig{Dir: dir, MaxPending: 5}, quiet)
+	c.reload()
+	r := wire.Result{LogID: 6, LogTime: 1, Code: wire.CodeSuccess}
+	c.mu.Lock() // the first half of Push(6): the oldest (claimed) results are trimmed out
+	c.pending = append(c.pending, r)
+	c.bytes += size(r)
+	overflow := c.trim()
+	c.mu.Unlock()
+	require.NotEmpty(t, overflow)
+
+	c.flush(t.Context()) // the sender delivers the rest and finds the queue empty
+	afterFlush, _ := filepath.Glob(filepath.Join(dir, "*"+claimedExt))
+	require.NoError(t, os.Chmod(dir, 0o500)) // the second half of Push(6): saving fails
+	c.saveOverflow(overflow)
+	require.NoError(t, os.Chmod(dir, 0o700))
+	c.flush(t.Context())
+	left, _ := filepath.Glob(filepath.Join(dir, "*"+claimedExt))
+
+	assert.Len(t, afterFlush, 1)
+	assert.Len(t, left, 1)
+}
+
+func TestRegistryDeregistersEvenWhenTheHeartbeatOutlastsTheBudget(t *testing.T) {
+	// Scenario: three admin addresses, the first two hanging, so the heartbeat in progress outlasts Close's context
+	// Expect: Close still sends the deregistration once its context is done (it reaches the live admin)
+	const timeout = 200 * time.Millisecond
+	dead, dead2 := newAdmin(t), newAdmin(t)
+	dead.hang.Store(true)
+	dead2.hang.Store(true)
+	var removed atomic.Int32
+	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if r.URL.Path == "/api/registryRemove" {
+			removed.Add(1)
+		}
+		_, _ = w.Write([]byte(`{"code":200}`))
+	}))
+	defer live.Close()
+	r := NewRegistry(NewClient([]string{dead.srv.URL, dead2.srv.URL, live.URL}, v2(t, ""), nil, timeout), quiet, "app",
+		"http://e/", time.Hour)
+	r.Start()
+	require.Eventually(t, func() bool { return dead.hits.Load() > 0 }, time.Second, time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), timeout)
+	defer cancel()
+
+	r.Close(ctx)
+
+	assert.Equal(t, int32(1), removed.Load())
 }

@@ -16,7 +16,7 @@ Requirements: Go 1.26+, [golangci-lint v2](https://golangci-lint.run/), and Dock
 end-to-end tests.
 
 ```bash
-make check    # golangci-lint + unit tests with -race (what CI runs)
+make check    # golangci-lint + unit tests with -race (CI also runs fuzz, govulncheck and e2e)
 make cover    # coverage summary
 make stress   # repeat the concurrency stress tests
 make fuzz     # run each fuzz target for FUZZTIME (default 30s)
@@ -55,9 +55,9 @@ integration):
 2. Tag the executor and push the tag: `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`. The release workflow
    records the GitHub release.
 3. In `otelxxljob/`, require the new executor version (`go get github.com/ShawineWu/go-xxljob@vX.Y.Z`, keeping the
-   `replace`), and check that it builds against the released executor rather than the repository's:
-   `go mod edit -dropreplace github.com/ShawineWu/go-xxljob && go test ./... && git checkout go.mod go.sum`. Commit,
-   wait for CI, then tag and push `otelxxljob/vX.Y.Z`.
+   `replace`) and commit that. Then check that it builds against the released executor rather than the
+   repository's: `go mod edit -dropreplace github.com/ShawineWu/go-xxljob && go test ./... && git checkout go.mod
+   go.sum` (this only undoes the check). Wait for CI, then tag and push `otelxxljob/vX.Y.Z`.
 
 ## Reporting security issues
 
