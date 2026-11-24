@@ -40,7 +40,7 @@ func NewClient(addrs []string, proto wire.Protocol, hc *http.Client, timeout tim
 	return &Client{addrs: slices.Clone(addrs), proto: proto, http: &c, timeout: timeout}
 }
 
-// Post calls /api/{action}. A response code other than 200 is an error. It tries every address once, starting with
+// Post calls an action on the admin (wire.Action*). A response code other than 200 is an error. It tries every address once, starting with
 // the last one that worked, and joins the errors if all fail.
 func (c *Client) Post(ctx context.Context, action string, payload any) error {
 	body, err := json.Marshal(payload)
@@ -51,7 +51,7 @@ func (c *Client) Post(ctx context.Context, action string, payload any) error {
 	var errs []error
 	for i := range c.addrs {
 		idx := (start + i) % len(c.addrs)
-		err := c.post(ctx, c.addrs[idx]+"/api/"+action, body)
+		err := c.post(ctx, wire.AdminURL(c.addrs[idx], action), body)
 		if err == nil {
 			c.next.Store(int64(idx))
 			return nil
@@ -85,15 +85,8 @@ func (c *Client) post(ctx context.Context, url string, body []byte) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("post %s: http status %d: %.200s", url, resp.StatusCode, data)
 	}
-	var rt struct {
-		Code int    `json:"code"`
-		Msg  string `json:"msg"`
-	}
-	if err := json.Unmarshal(data, &rt); err != nil {
-		return fmt.Errorf("post %s: invalid response %.200q: %w", url, data, err)
-	}
-	if rt.Code != wire.CodeSuccess {
-		return fmt.Errorf("post %s: code %d: %s", url, rt.Code, rt.Msg)
+	if err := wire.DecodeAdminReply(data); err != nil {
+		return fmt.Errorf("post %s: %w", url, err)
 	}
 	return nil
 }

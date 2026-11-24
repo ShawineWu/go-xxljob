@@ -218,7 +218,7 @@ XXL-JOB 3.5.0 修改了执行器协议，与旧版本不兼容，所以要按调
 
 ### 优雅退出
 
-`Run` 的 ctx 结束时（或调用 `Shutdown(ctx)` 时），执行器会拒绝新的调度、注销、最多等执行中的任务 `ShutdownTimeout`（或直到 `ctx` 超时）、取消剩下的任务，并发出剩余的结果。每一步都有上限：只有一个调度中心地址时，关停最多耗时 `ShutdownTimeout + 2×RequestTimeout + 2×CancelWait + 1s`，默认配置下是 28 秒，在 Kubernetes 默认的 30 秒 `terminationGracePeriodSeconds` 之内。如果为了长任务调大了 `ShutdownTimeout`，宽限期也要相应调大。
+`Run` 的 ctx 结束时（或调用 `Shutdown(ctx)` 时），执行器会拒绝新的调度、注销、最多等执行中的任务 `ShutdownTimeout`（或直到 `ctx` 超时）、取消剩下的任务，并发出剩余的结果。每一步都有上限：只有一个调度中心地址时，关停最多耗时 `ShutdownTimeout + RequestTimeout + 2×CancelWait + 1s`（`RequestTimeout ≤ CancelWait` 且 `ShutdownTimeout ≥ 2×RequestTimeout` 时），默认配置下是 25 秒，在 Kubernetes 默认的 30 秒 `terminationGracePeriodSeconds` 之内。如果为了长任务调大了 `ShutdownTimeout`，宽限期也要相应调大。
 
 ### 跨重启保留结果
 
@@ -247,7 +247,7 @@ env:
 | 资源 | 上限 |
 |---|---|
 | 任务 goroutine | `MaxActiveTriggers`（每个有执行中或排队调度的任务一个），另加每个正在执行的 handler 一个 |
-| 内存中的调度 | 合计 `MaxActiveTriggers`，单个任务 `MaxQueueSize`；每个请求体最多 256 KiB |
+| 内存中的调度 | 合计 `MaxActiveTriggers`，单个任务 `MaxQueueSize`；每个请求体最多 64 KiB |
 | 同时执行的 handler | 设置了 `MaxConcurrency` 时受其限制 |
 | 内存中的执行日志 | 16 MiB（`NewMemoryLogStore`），单次执行最多占 1/8，优先淘汰最早结束的执行 |
 | 磁盘上的执行日志 | 单次执行 16 MiB（`FileLogStore`），按保留期清理；每个执行中的任务打开一个文件 |
@@ -307,7 +307,7 @@ if _, err := otelxxljob.Instrument(exec); err != nil { ... } // 在 Start 之前
 | 存储 | |
 |---|---|
 | `NewMemoryLogStore(maxBytes)`（默认） | 共 16 MiB，单次执行最多占 1/8，优先淘汰最早结束的执行；重启后丢失 |
-| `NewFileLogStore(dir, retentionDays)` | `{dir}/{yyyy-MM-dd}/{logId}.log`，单次执行最多 16 MiB，保留最近 `retentionDays` 天 |
+| `NewFileLogStore(FileLogStoreConfig{...})` | `{Dir}/{yyyy-MM-dd}/{logId}.log`，单次执行最多 `MaxRunBytes`（默认 16 MiB），保留最近 `RetentionDays` 天 |
 | 自定义 | 实现 `LogStore` 接口，用 `WithLogStore` 传入 |
 
 单行超过 8 KiB 会被截断。调度中心读取日志时从指定行一直读到末尾，和官方执行器一致。存储出错或 panic 都不会让任务失败，错误只记一次日志。
@@ -362,14 +362,14 @@ err := exec.Run(ctx) // 注册和回调；调度中心的请求由你的 HTTP �
 
 ### 注册与退出
 
-`Start` 先监听端口再注册：端口被占用时直接返回错误，不会注册一个收不到调度的执行器。之后每 30s 续期一次。
+`Start` 先监听端口再注册：端口被占用时直接返回错误，不会注册一个收不到调度的执行器。之后每 `RegistryInterval`（默认 30s）续期一次。
 
 `Shutdown(ctx)` 按开始时确定的时间计划执行：
 
 1. 拒绝新的调度（存活检测也返回失败，故障转移路由会把调度改派给其他实例）；
-2. 停止心跳并注销（最多 `RequestTimeout`）；
+2. 停止心跳，等正在进行的心跳结束，再注销（最多 `2×RequestTimeout`）；
 3. 丢弃排队中和等待并发空位的调度；等执行中的任务结束直到 `ctx` 超时，然后取消任务，最多再等 `CancelWait`；
-4. 发送剩余的结果（至少 `CancelWait`）；剩下的写入 `CallbackDir`，或记为丢失；
+4. 发送剩余的结果（至少 `CancelWait`，且总会再尝试一次）；剩下的写入 `CallbackDir`（最多 512 MiB），或记为丢失；
 5. 最后关闭执行器端口，等待期间调度中心仍可终止任务。
 
 ### 协议版本
@@ -379,7 +379,7 @@ err := exec.Run(ctx) // 注册和回调；调度中心的请求由你的 HTTP �
 ### 安全
 
 - 配置了 `AccessToken` 时，执行器端口的每个请求在执行任何操作前都会校验 token（常量时间比较，且不泄露长度）；3.5 协议还会校验 `XXL-JOB-APPNAME`。**不配置时，任何能访问端口的人都能触发、终止任务并读取日志**，执行器启动时会打一条警告。
-- 请求体上限 256 KiB；HTTP 服务有超时；发往调度中心的请求都有超时，并且不跟随重定向（重定向会把 token 带到别的主机）。
+- 请求体和请求头上限 64 KiB；HTTP 服务有超时；发往调度中心的请求都有超时，并且不跟随重定向（重定向会把 token 带到别的主机）。
 - 任务参数不会出现在错误信息里，在执行日志中也会截断。
 - 只支持 BEAN 模式，调度中心下发的 GLUE 脚本会被拒绝，不会执行。
 

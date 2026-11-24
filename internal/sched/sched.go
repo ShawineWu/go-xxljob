@@ -25,6 +25,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 )
@@ -53,13 +54,6 @@ const (
 	CoverEarly   = "COVER_EARLY"
 )
 
-// Result codes.
-const (
-	CodeSuccess = 200
-	CodeFail    = 500
-	CodeTimeout = 502
-)
-
 // Trigger is one trigger of a job.
 type Trigger struct {
 	JobID    int64
@@ -68,17 +62,56 @@ type Trigger struct {
 	Handler  string // a change of handler cancels the job's running trigger
 	Strategy string // one of the block strategies; anything else means Serial
 	Timeout  time.Duration
-	// Run executes the trigger and returns its outcome. It is called at most once, with a context that is cancelled
-	// with one of the causes above, and it must return (it may return after its outcome was already reported).
-	Run func(ctx context.Context) Outcome
+	// Run executes the trigger. It is called at most once, with a context that is cancelled with one of the causes
+	// above, and it must return (it may return after the trigger's outcome was already reported).
+	Run func(ctx context.Context) Result
 }
+
+// Result is what a run produced: a failure with its message, or a success with an optional note. It is plain data,
+// so that classifying it never calls into user code.
+type Result struct {
+	Failed bool
+	Msg    string
+}
+
+// Status is how a trigger ended.
+type Status uint8
+
+// Statuses, reported to the admin as codes 200, 500 and 502.
+const (
+	Succeeded Status = iota
+	Failed
+	TimedOut
+)
 
 // Outcome is the result reported for a trigger.
 type Outcome struct {
-	Code int
-	Msg  string
-	// Started is false when the trigger was discarded or cancelled before its Run was called.
-	Started bool
+	Status Status
+	Msg    string
+}
+
+// Classify decides the outcome of a run. It is the only place that does: a cancellation cause wins over what the
+// run returned, so a killed or timed-out run that ignored its cancellation is never reported as a success.
+func Classify(cause error, r Result) Outcome {
+	switch {
+	case errors.Is(cause, ErrTimeout):
+		return Outcome{TimedOut, cause.Error()}
+	case IsCause(cause):
+		return Outcome{Failed, cause.Error()}
+	case r.Failed:
+		return Outcome{Failed, r.Msg}
+	}
+	return Outcome{Succeeded, r.Msg}
+}
+
+// IsCause reports whether err is (or wraps) one of the scheduler's cancellation causes.
+func IsCause(err error) bool {
+	for _, c := range []error{ErrKilled, ErrCovered, ErrHandlerChanged, ErrTimeout, ErrShutdown} {
+		if errors.Is(err, c) {
+			return true
+		}
+	}
+	return false
 }
 
 // Reporter receives the outcome of every accepted trigger, exactly once. It is called without the scheduler's lock
@@ -236,11 +269,9 @@ func (s *Scheduler) admit(tr *Trigger) *run {
 
 // to moves r to phase p. Called with s.mu held; an illegal move is a bug.
 func (s *Scheduler) to(r *run, p phase) {
-	for _, ok := range next[r.phase] {
-		if ok == p {
-			r.phase = p
-			return
-		}
+	if slices.Contains(next[r.phase], p) {
+		r.phase = p
+		return
 	}
 	panic(fmt.Sprintf("sched: illegal phase change %s -> %s (log_id %d)", r.phase, p, r.tr.LogID))
 }
@@ -254,10 +285,10 @@ func (s *Scheduler) settle(r *run, o Outcome) {
 		return
 	}
 	r.reported = true
-	switch o.Code {
-	case CodeSuccess:
+	switch o.Status {
+	case Succeeded:
 		s.stats.Succeeded++
-	case CodeTimeout:
+	case TimedOut:
 		s.stats.TimedOut++
 	default:
 		s.stats.Failed++
@@ -338,14 +369,21 @@ func (s *Scheduler) Close(ctx context.Context, grace time.Duration) error {
 		return nil
 	}
 	s.mu.Lock()
+	var cancelled []*run
 	for _, t := range s.threads {
 		if t.current != nil {
 			t.current.cancel(ErrShutdown)
+			cancelled = append(cancelled, t.current)
 		}
 	}
 	s.mu.Unlock()
 	gctx, cancel := context.WithTimeout(context.Background(), grace)
 	defer cancel()
+	// A cancellation is reported at once, from the cancelled context's AfterFunc, and reporting never blocks for
+	// long: wait for those reports, whatever the grace, so that none arrives after Close has returned.
+	for _, r := range cancelled {
+		<-r.delivered
+	}
 	if s.waitIdle(gctx) {
 		s.wg.Wait()
 	}
@@ -385,7 +423,7 @@ func (s *Scheduler) abort(t *thread, cause error) []*run {
 // discard settles and retires runs removed from a queue before they started.
 func (s *Scheduler) discard(dropped []*run, cause error) {
 	for _, r := range dropped {
-		s.settle(r, Outcome{Code: CodeFail, Msg: "trigger discarded: " + cause.Error()})
+		s.settle(r, Outcome{Failed, "trigger discarded: " + cause.Error()})
 		s.retire(r)
 	}
 }
@@ -419,7 +457,7 @@ func (s *Scheduler) loop(t *thread) {
 func (s *Scheduler) execute(r *run) {
 	defer s.retire(r)
 	if !s.acquire(r) {
-		s.settle(r, outcomeOf(context.Cause(r.ctx), false))
+		s.settle(r, Classify(context.Cause(r.ctx), Result{}))
 		return
 	}
 	if s.sem != nil {
@@ -433,22 +471,29 @@ func (s *Scheduler) execute(r *run) {
 		defer stop()
 	}
 	stopWatch := context.AfterFunc(ctx, func() {
-		if cause := context.Cause(ctx); isCause(cause) {
+		if cause := context.Cause(ctx); IsCause(cause) {
 			s.mu.Lock()
 			if r.phase == running {
 				s.to(r, cancelling)
 			}
 			s.mu.Unlock()
-			s.settle(r, outcomeOf(cause, true))
+			s.settle(r, Classify(cause, Result{}))
 		}
 	})
-	o := r.tr.Run(ctx)
+	res := s.call(ctx, r.tr)
 	stopWatch()
-	if cause := context.Cause(ctx); isCause(cause) {
-		o = outcomeOf(cause, true) // a run that ignored its cancellation does not get to report success
-	}
-	o.Started = true
-	s.settle(r, o)
+	s.settle(r, Classify(context.Cause(ctx), res))
+}
+
+// call runs the trigger. Run is not expected to panic; if it does anyway, the run fails instead of leaving its job
+// busy forever.
+func (s *Scheduler) call(ctx context.Context, tr *Trigger) (res Result) {
+	defer func() {
+		if p := recover(); p != nil {
+			res = Result{Failed: true, Msg: fmt.Sprint("xxljob: run panicked: ", p)}
+		}
+	}()
+	return tr.Run(ctx)
 }
 
 // acquire moves r from ready to running, taking a concurrency slot first. A run that has to wait for a slot is
@@ -489,22 +534,4 @@ func (s *Scheduler) wait(r *run) bool {
 	case <-r.ctx.Done():
 		return false
 	}
-}
-
-func isCause(err error) bool {
-	for _, c := range []error{ErrKilled, ErrCovered, ErrHandlerChanged, ErrTimeout, ErrShutdown} {
-		if errors.Is(err, c) {
-			return true
-		}
-	}
-	return false
-}
-
-// outcomeOf is the outcome of a run cancelled with cause.
-func outcomeOf(cause error, started bool) Outcome {
-	code := CodeFail
-	if errors.Is(cause, ErrTimeout) {
-		code = CodeTimeout
-	}
-	return Outcome{Code: code, Msg: cause.Error(), Started: started}
 }

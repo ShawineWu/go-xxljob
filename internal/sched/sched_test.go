@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -47,9 +48,9 @@ func (r *recorder) reported(logID int64) bool {
 }
 
 // trigger builds a trigger whose Run is wrapped to record start order and overlap.
-func (r *recorder) trigger(jobID, logID int64, strategy string, run func(ctx context.Context) Outcome) *Trigger {
+func (r *recorder) trigger(jobID, logID int64, strategy string, run func(ctx context.Context) Result) *Trigger {
 	tr := &Trigger{JobID: jobID, LogID: logID, Handler: "h", Strategy: strategy}
-	tr.Run = func(ctx context.Context) Outcome {
+	tr.Run = func(ctx context.Context) Result {
 		r.mu.Lock()
 		r.order = append(r.order, logID)
 		r.active[jobID]++
@@ -67,25 +68,25 @@ func (r *recorder) trigger(jobID, logID int64, strategy string, run func(ctx con
 	return tr
 }
 
-func succeed(context.Context) Outcome { return Outcome{Code: CodeSuccess} }
+func succeed(context.Context) Result { return Result{} }
 
 // sleep runs for d unless cancelled.
-func sleep(d time.Duration) func(context.Context) Outcome {
-	return func(ctx context.Context) Outcome {
+func sleep(d time.Duration) func(context.Context) Result {
+	return func(ctx context.Context) Result {
 		select {
 		case <-time.After(d):
-			return Outcome{Code: CodeSuccess, Msg: "done"}
+			return Result{Msg: "done"}
 		case <-ctx.Done():
-			return Outcome{Code: CodeFail, Msg: "cancelled"}
+			return Result{Failed: true, Msg: "cancelled"}
 		}
 	}
 }
 
 // stubborn runs for d and ignores cancellation, then claims success.
-func stubborn(d time.Duration) func(context.Context) Outcome {
-	return func(context.Context) Outcome {
+func stubborn(d time.Duration) func(context.Context) Result {
+	return func(context.Context) Result {
 		time.Sleep(d)
-		return Outcome{Code: CodeSuccess, Msg: "ignored cancellation"}
+		return Result{Msg: "ignored cancellation"}
 	}
 }
 
@@ -106,7 +107,7 @@ func TestSerialRunsInOrder(t *testing.T) {
 		assert.Equal(t, Stats{Running: 1, Queued: 2, Active: 3, Accepted: 3}, busy)
 		assert.Equal(t, []int64{1, 2, 3}, rec.order)
 		for i := int64(1); i <= 3; i++ {
-			assert.Equal(t, Outcome{Code: CodeSuccess, Msg: "done", Started: true}, rec.outcome(t, i))
+			assert.Equal(t, Outcome{Succeeded, "done"}, rec.outcome(t, i))
 		}
 		assert.Zero(t, rec.overlaps)
 		assert.False(t, s.Busy(1))
@@ -131,7 +132,7 @@ func TestDiscardLater(t *testing.T) {
 		require.ErrorIs(t, busyErr, ErrDiscardLater)
 		require.NoError(t, idleErr)
 		assert.False(t, rec.reported(2))
-		assert.Equal(t, CodeSuccess, rec.outcome(t, 3).Code)
+		assert.Equal(t, Succeeded, rec.outcome(t, 3).Status)
 		assert.Equal(t, int64(1), s.Stats().Rejected)
 	})
 }
@@ -156,9 +157,9 @@ func TestCoverEarly(t *testing.T) {
 
 		assert.True(t, coveredAt, "covered run reported immediately")
 		assert.False(t, startedEarly, "new trigger waits for the covered run to return")
-		assert.Equal(t, Outcome{Code: CodeFail, Msg: ErrCovered.Error(), Started: true}, rec.outcome(t, 1))
-		assert.Equal(t, Outcome{Code: CodeFail, Msg: "trigger discarded: " + ErrCovered.Error()}, rec.outcome(t, 2))
-		assert.Equal(t, CodeSuccess, rec.outcome(t, 3).Code)
+		assert.Equal(t, Outcome{Failed, ErrCovered.Error()}, rec.outcome(t, 1))
+		assert.Equal(t, Outcome{Failed, "trigger discarded: " + ErrCovered.Error()}, rec.outcome(t, 2))
+		assert.Equal(t, Succeeded, rec.outcome(t, 3).Status)
 		assert.Equal(t, []int64{1, 3}, rec.order)
 		assert.Zero(t, rec.overlaps)
 	})
@@ -181,7 +182,7 @@ func TestHandlerChange(t *testing.T) {
 
 		assert.Equal(t, ErrHandlerChanged.Error(), rec.outcome(t, 1).Msg)
 		assert.Equal(t, "trigger discarded: "+ErrHandlerChanged.Error(), rec.outcome(t, 2).Msg)
-		assert.Equal(t, CodeSuccess, rec.outcome(t, 3).Code)
+		assert.Equal(t, Succeeded, rec.outcome(t, 3).Status)
 	})
 }
 
@@ -207,9 +208,9 @@ func TestKill(t *testing.T) {
 
 		assert.True(t, killed)
 		assert.True(t, reportedAt, "killed run reported immediately")
-		assert.Equal(t, Outcome{Code: CodeFail, Msg: ErrKilled.Error(), Started: true}, rec.outcome(t, 1))
+		assert.Equal(t, Outcome{Failed, ErrKilled.Error()}, rec.outcome(t, 1))
 		assert.Equal(t, "trigger discarded: "+ErrKilled.Error(), rec.outcome(t, 2).Msg)
-		assert.Equal(t, CodeSuccess, rec.outcome(t, 3).Code)
+		assert.Equal(t, Succeeded, rec.outcome(t, 3).Status)
 		assert.Equal(t, 1, stillBusy.Running)
 		assert.Zero(t, rec.overlaps)
 		assert.False(t, s.Kill(1))
@@ -238,8 +239,8 @@ func TestTimeout(t *testing.T) {
 		atDeadline := s.Stats()
 
 		assert.False(t, early)
-		assert.Equal(t, Outcome{Code: CodeTimeout, Msg: ErrTimeout.Error(), Started: true}, rec.outcome(t, 1))
-		assert.Equal(t, Outcome{Code: CodeTimeout, Msg: ErrTimeout.Error(), Started: true}, rec.outcome(t, 2))
+		assert.Equal(t, Outcome{TimedOut, ErrTimeout.Error()}, rec.outcome(t, 1))
+		assert.Equal(t, Outcome{TimedOut, ErrTimeout.Error()}, rec.outcome(t, 2))
 		assert.Equal(t, 1, atDeadline.Running, "the stubborn run still occupies its job")
 		assert.Equal(t, int64(2), atDeadline.TimedOut)
 		time.Sleep(10 * time.Second)
@@ -254,7 +255,7 @@ func TestMaxConcurrency(t *testing.T) {
 		// Expect: never more than 2 runs at once; waiting triggers count as running; the killed one never runs
 		var mu sync.Mutex
 		active, peak := 0, 0
-		track := func(ctx context.Context) Outcome {
+		track := func(ctx context.Context) Result {
 			mu.Lock()
 			active++
 			peak = max(peak, active)
@@ -287,7 +288,7 @@ func TestMaxConcurrency(t *testing.T) {
 		assert.Len(t, started, 2)
 		assert.Equal(t, 4, waiting.Running)
 		assert.Equal(t, 2, peak)
-		assert.Equal(t, Outcome{Code: CodeFail, Msg: ErrKilled.Error()}, rec.outcome(t, victim))
+		assert.Equal(t, Outcome{Failed, ErrKilled.Error()}, rec.outcome(t, victim))
 		assert.NotContains(t, rec.order, victim)
 		assert.Equal(t, int64(3), s.Stats().Succeeded)
 	})
@@ -336,15 +337,15 @@ func TestRejections(t *testing.T) {
 func TestClose(t *testing.T) {
 	cases := []struct {
 		name     string
-		run      func(context.Context) Outcome
+		run      func(context.Context) Result
 		deadline time.Duration
 		wantErr  error
 		want     Outcome
 	}{
 		{"running trigger finishes in time", sleep(time.Second), 5 * time.Second, nil,
-			Outcome{Code: CodeSuccess, Msg: "done", Started: true}},
+			Outcome{Succeeded, "done"}},
 		{"running trigger is cancelled at the deadline", sleep(time.Minute), time.Second, context.DeadlineExceeded,
-			Outcome{Code: CodeFail, Msg: ErrShutdown.Error(), Started: true}},
+			Outcome{Failed, ErrShutdown.Error()}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -399,7 +400,7 @@ func TestCloseRightAfterSubmit(t *testing.T) {
 		err := s.Close(t.Context(), time.Second)
 
 		require.NoError(t, err)
-		assert.Equal(t, CodeSuccess, rec.outcome(t, 1).Code)
+		assert.Equal(t, Succeeded, rec.outcome(t, 1).Status)
 	})
 }
 
@@ -417,8 +418,8 @@ func TestCloseDiscardsTriggersWaitingForASlot(t *testing.T) {
 		err := s.Close(t.Context(), time.Second)
 
 		require.NoError(t, err)
-		assert.Equal(t, CodeSuccess, rec.outcome(t, 1).Code)
-		assert.Equal(t, Outcome{Code: CodeFail, Msg: ErrShutdown.Error()}, rec.outcome(t, 2))
+		assert.Equal(t, Succeeded, rec.outcome(t, 1).Status)
+		assert.Equal(t, Outcome{Failed, ErrShutdown.Error()}, rec.outcome(t, 2))
 		assert.Equal(t, []int64{1}, rec.order)
 	})
 }
@@ -430,7 +431,7 @@ func TestCountersBalance(t *testing.T) {
 	rec := newRecorder()
 	s := New(Config{MaxQueue: 3, MaxConcurrency: 4}, rec.report)
 	strategies := []string{Serial, DiscardLater, CoverEarly}
-	runs := []func(context.Context) Outcome{succeed, sleep(time.Millisecond), stubborn(time.Millisecond)}
+	runs := []func(context.Context) Result{succeed, sleep(time.Millisecond), stubborn(time.Millisecond)}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	accepted := map[int64]bool{}
@@ -472,12 +473,29 @@ func TestCountersBalance(t *testing.T) {
 	assert.Zero(t, rec.overlaps)
 }
 
-func TestOutcomeOf(t *testing.T) {
-	// Scenario: map cancellation causes (possibly wrapped) to result codes
-	assert.Equal(t, CodeTimeout, outcomeOf(ErrTimeout, true).Code)
-	assert.Equal(t, CodeFail, outcomeOf(ErrKilled, true).Code)
-	assert.True(t, isCause(errors.Join(errors.New("x"), ErrCovered)))
-	assert.False(t, isCause(context.Canceled))
+func TestClassify(t *testing.T) {
+	// Scenario: classify runs by cancellation cause and result
+	// Expect: a cause (possibly wrapped) wins over the result; otherwise an error fails and nil succeeds with the note
+	assert.Equal(t, Outcome{TimedOut, ErrTimeout.Error()}, Classify(ErrTimeout, Result{Msg: "ok"}))
+	assert.Equal(t, Outcome{Failed, "x\n" + ErrCovered.Error()}, Classify(errors.Join(errors.New("x"), ErrCovered), Result{}))
+	assert.Equal(t, Outcome{Failed, "bad"}, Classify(context.Canceled, Result{Failed: true, Msg: "bad"}))
+	assert.Equal(t, Outcome{Succeeded, "ok"}, Classify(nil, Result{Msg: "ok"}))
+	assert.False(t, IsCause(context.Canceled))
+}
+
+func TestPanickingRunFails(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Scenario: a Run function panics (a bug outside the handler's containment)
+		// Expect: the run fails with the panic as its message and its job is free again
+		rec := newRecorder()
+		s := New(Config{}, rec.report)
+
+		require.NoError(t, s.Submit(rec.trigger(1, 1, Serial, func(context.Context) Result { panic("boom") })))
+		synctest.Wait()
+
+		assert.Equal(t, Outcome{Failed, "xxljob: run panicked: boom"}, rec.outcome(t, 1))
+		assert.False(t, s.Busy(1))
+	})
 }
 
 func TestMaxActiveBoundsJobThreads(t *testing.T) {
@@ -487,7 +505,7 @@ func TestMaxActiveBoundsJobThreads(t *testing.T) {
 		rec := newRecorder()
 		s := New(Config{MaxActive: 50}, rec.report)
 		release := make(chan struct{})
-		block := func(context.Context) Outcome { <-release; return Outcome{Code: CodeSuccess} }
+		block := func(context.Context) Result { <-release; return Result{} }
 
 		accepted := 0
 		for job := int64(1); job <= 500; job++ {
@@ -535,11 +553,11 @@ func TestRunFinishesOnlyAfterItsReportIsDelivered(t *testing.T) {
 		mu.Unlock()
 	})
 	started := make(chan struct{})
-	require.NoError(t, s.Submit(&Trigger{JobID: 1, LogID: 1, Run: func(ctx context.Context) Outcome {
+	require.NoError(t, s.Submit(&Trigger{JobID: 1, LogID: 1, Run: func(ctx context.Context) Result {
 		close(started)
 		<-ctx.Done()
 		<-reporting // the kill report is being delivered by the cancellation's goroutine
-		return Outcome{Code: CodeSuccess}
+		return Result{}
 	}}))
 	<-started
 	s.Kill(1)
@@ -556,4 +574,33 @@ func TestRunFinishesOnlyAfterItsReportIsDelivered(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	assert.True(t, delivered)
+}
+
+func TestCloseWaitsForCancellationReports(t *testing.T) {
+	// Scenario: Close with an expired context and almost no grace, while a run ignores its cancellation
+	// Expect: Close still returns only after the cancellation has been reported, so nothing is reported after the
+	//         caller has shut its reporting down
+	for i := range 50 {
+		var closed, late atomic.Bool
+		started, release := make(chan struct{}), make(chan struct{})
+		s := New(Config{}, func(*Trigger, Outcome) {
+			if closed.Load() {
+				late.Store(true)
+			}
+		})
+		require.NoError(t, s.Submit(&Trigger{JobID: 1, LogID: int64(i + 1), Run: func(context.Context) Result {
+			close(started)
+			<-release // ignores its context
+			return Result{}
+		}}))
+		<-started
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		require.ErrorIs(t, s.Close(ctx, time.Nanosecond), context.Canceled)
+		closed.Store(true)
+		close(release)
+
+		require.False(t, late.Load(), "run %d: reported after Close returned", i)
+	}
 }

@@ -31,7 +31,7 @@ func main() {
 
 func run(logger *slog.Logger) error {
 	dataDir := envOr("XXL_JOB_DATA_DIR", filepath.Join(os.TempDir(), "go-xxljob"))
-	logs, err := xxljob.NewFileLogStore(filepath.Join(dataDir, "logs"), 7)
+	logs, err := xxljob.NewFileLogStore(xxljob.FileLogStoreConfig{Dir: filepath.Join(dataDir, "logs"), RetentionDays: 7})
 	if err != nil {
 		return err
 	}

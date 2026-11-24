@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -37,6 +39,8 @@ func TestConfigNormalize(t *testing.T) {
 		{"bad port", func(c *Config) { c.Port = 70000 }, "invalid port"},
 		{"negative interval", func(c *Config) { c.RegistryInterval = -time.Second }, "RegistryInterval must not be negative"},
 		{"negative queue", func(c *Config) { c.MaxQueueSize = -1 }, "MaxQueueSize must not be negative"},
+		{"negative concurrency", func(c *Config) { c.MaxConcurrency = -1 }, "MaxConcurrency must not be negative"},
+		{"negative default timeout", func(c *Config) { c.DefaultTimeout = -time.Second }, "DefaultTimeout must not be negative"},
 		{"bad address", func(c *Config) { c.Address = "not a url" }, "invalid executor address"},
 	}
 	for _, c := range cases {
@@ -61,7 +65,34 @@ func TestConfigNormalize(t *testing.T) {
 	assert.Equal(t, DefaultShutdownTimeout, got.ShutdownTimeout)
 	assert.Equal(t, DefaultMaxActiveTriggers, got.MaxActiveTriggers)
 	assert.Equal(t, DefaultLongRunningThreshold, got.LongRunningThreshold)
+	assert.Zero(t, got.MaxConcurrency, "no limit")
+	assert.Zero(t, got.DefaultTimeout, "no limit")
+	disabled := base
+	disabled.LongRunningThreshold = -1
+	got, err = disabled.normalize()
+	require.NoError(t, err, "a negative LongRunningThreshold disables the warning")
+	assert.Negative(t, got.LongRunningThreshold)
 }
+
+func TestWithHTTPClient(t *testing.T) {
+	// Scenario: the application passes its own HTTP client, with a transport that marks every request
+	// Expect: requests to the admin go through it
+	var used atomic.Int32
+	admin := newFakeAdmin(t)
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		used.Add(1)
+		return http.DefaultTransport.RoundTrip(r)
+	})}
+
+	h := startHarness(t, admin, testConfig(admin.srv.URL), nil, WithLogger(quiet), WithHTTPClient(client))
+
+	require.Eventually(t, func() bool { return h.e.Stats().Registered }, time.Second, 5*time.Millisecond)
+	assert.Positive(t, used.Load())
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestPodIPFromEnv(t *testing.T) {
 	// Scenario: Kubernetes injects POD_IP through the Downward API and no IP or Address is configured
@@ -119,7 +150,7 @@ func TestMiddleware(t *testing.T) {
 	// Scenario: global middlewares (option and Use) and a handler's own; one middleware constructor calls back into
 	//           the executor; another handler's middleware panics while being built
 	// Expect: they run outermost first (option, Use, own); calling the executor from a constructor does not deadlock;
-	//         a panicking constructor fails that trigger instead of the process
+	//         a panicking constructor fails that run (reported to the admin) instead of the process
 	var order []string
 	mw := func(name string) Middleware {
 		return func(next Handler) Handler {
@@ -143,12 +174,15 @@ func TestMiddleware(t *testing.T) {
 
 	ok := h.run(t, trigger{JobID: 1, LogID: 1, ExecutorHandler: "T"})
 	h.admin.callback(t, 1)
-	broken := h.run(t, trigger{JobID: 2, LogID: 2, ExecutorHandler: "Broken"})
+	accepted := h.run(t, trigger{JobID: 2, LogID: 2, ExecutorHandler: "Broken"})
+	broken := h.admin.callback(t, 2)
 
 	assert.Equal(t, CodeSuccess, ok.Code)
 	assert.Equal(t, []string{"option", "use", "own"}, order)
+	assert.Equal(t, CodeSuccess, accepted.Code, "middlewares are built when the run starts")
 	assert.Equal(t, CodeFailure, broken.Code)
 	assert.Contains(t, broken.Msg, `middleware for handler "Broken" panicked: bad middleware`)
+	assert.False(t, h.e.sched.Busy(2))
 }
 
 func TestHandlerCannotRedirectItsResult(t *testing.T) {
@@ -254,9 +288,9 @@ func TestRun(t *testing.T) {
 }
 
 func TestShutdownIsBounded(t *testing.T) {
-	// Scenario: the admin is unreachable and a result is pending; Shutdown is called with a context that has no
-	//           deadline (no job is running)
-	// Expect: Shutdown returns within its bounded steps instead of retrying forever; the result is logged as lost
+	// Scenario: the admin stops answering (requests hang) while a result is pending; Shutdown is called with a context
+	//           that has no deadline (no job is running)
+	// Expect: Shutdown returns within its bounded steps instead of waiting on the admin; the result is logged as lost
 	logs, logger := capture()
 	admin := newFakeAdmin(t)
 	cfg := testConfig(admin.srv.URL)
@@ -264,7 +298,7 @@ func TestShutdownIsBounded(t *testing.T) {
 	cfg.CancelWait = 300 * time.Millisecond
 	h := startHarness(t, admin, cfg, map[string]Handler{"T": HandlerFunc(noop)}, WithLogger(logger))
 	require.Eventually(t, func() bool { return h.e.Stats().Registered }, time.Second, 5*time.Millisecond)
-	admin.down.Store(true)
+	admin.hang.Store(true)
 	h.run(t, trigger{JobID: 1, LogID: 1, ExecutorHandler: "T"})
 	require.Eventually(t, func() bool { return h.e.Stats().PendingCallbacks == 1 }, time.Second, 5*time.Millisecond)
 
@@ -272,7 +306,9 @@ func TestShutdownIsBounded(t *testing.T) {
 	err := h.e.Shutdown(context.Background())
 
 	require.NoError(t, err)
-	assert.Less(t, time.Since(start), 2*time.Second) // RequestTimeout + CancelWait + port, with slack
+	// heartbeat and deregistration (2×RequestTimeout), the callback in progress and one more attempt (at most
+	// CancelWait + RequestTimeout), with slack
+	assert.Less(t, time.Since(start), 2*time.Second)
 	assert.Contains(t, logs.String(), "results not delivered before shutdown, results lost")
 }
 
@@ -370,6 +406,7 @@ func TestManyJobsAreBounded(t *testing.T) {
 			busyMsg = r.Msg
 		}
 	}
+	require.Eventually(t, func() bool { return h.e.Stats().Running == 20 }, time.Second, 5*time.Millisecond)
 	close(g.release)
 
 	assert.Equal(t, int32(20), accepted.Load())
@@ -380,32 +417,60 @@ func TestFileLogStoreClosesFiles(t *testing.T) {
 	// Scenario: many runs with a FileLogStore, each with a goroutine that keeps logging after the run returned
 	// Expect: late lines are dropped instead of reopening the log, so no file stays open after the runs ended
 	dir := t.TempDir()
-	store, err := NewFileLogStore(dir, 0)
+	store, err := NewFileLogStore(FileLogStoreConfig{Dir: dir})
 	require.NoError(t, err)
 	admin := newFakeAdmin(t)
 	release := make(chan struct{})
+	var late sync.WaitGroup
 	h := startHarness(t, admin, testConfig(admin.srv.URL), map[string]Handler{"T": HandlerFunc(func(ctx context.Context, _ *Request) error {
-		go func() {
+		late.Go(func() {
 			<-release
 			Logger(ctx).Info("late line")
-		}()
+		})
 		return nil
 	})}, WithLogger(quiet), WithLogStore(store))
+	openLogs := func() int {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return len(store.open)
+	}
 
 	for i := int64(1); i <= 20; i++ {
 		h.run(t, trigger{JobID: i, LogID: i, ExecutorHandler: "T"})
 		h.admin.callback(t, i)
 	}
-	time.Sleep(50 * time.Millisecond) // every run has ended its log
+	require.Eventually(t, func() bool { return openLogs() == 0 }, time.Second, 5*time.Millisecond) // every run ended its log
 	close(release)
-	time.Sleep(50 * time.Millisecond)
-	store.mu.Lock()
-	open := len(store.open)
-	store.mu.Unlock()
-	data, err := os.ReadFile(filepath.Join(dir, time.Now().Format(time.DateOnly), "1.log"))
+	late.Wait()
+	data, err := os.ReadFile(store.path(LogRef{LogID: 1, LogTime: time.Now()}))
 	require.NoError(t, err)
 
-	assert.Zero(t, open)
+	assert.Zero(t, openLogs())
 	assert.NotContains(t, string(data), "late line")
 	assert.True(t, strings.HasSuffix(strings.TrimSpace(string(data)), `result=""`) || strings.Contains(string(data), "job succeeded"))
+}
+
+func TestErrorThatPanicsDoesNotWedgeTheJob(t *testing.T) {
+	// Scenario: a handler returns a typed-nil error whose Error method dereferences its receiver; then the job is
+	//           triggered again, and the executor shuts down
+	// Expect: the run is reported as failed; the job is free again and its next trigger runs; nothing crashes
+	var calls atomic.Int32
+	h := newHarness(t, map[string]Handler{"T": HandlerFunc(func(context.Context, *Request) error {
+		if calls.Add(1) == 1 {
+			var e *nilErr
+			return e
+		}
+		return nil
+	})})
+
+	h.run(t, trigger{JobID: 1, LogID: 1, ExecutorHandler: "T"})
+	first := h.admin.callback(t, 1)
+	again := h.run(t, trigger{JobID: 1, LogID: 2, ExecutorHandler: "T", ExecutorBlockStrategy: BlockDiscardLater})
+	second := h.admin.callback(t, 2)
+
+	assert.Equal(t, CodeFailure, first.Code)
+	assert.Contains(t, first.Msg, "nil pointer dereference")
+	assert.Equal(t, CodeSuccess, again.Code, "the job is not left busy")
+	assert.Equal(t, CodeSuccess, second.Code)
+	require.NoError(t, h.e.Shutdown(t.Context()))
 }

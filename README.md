@@ -235,8 +235,8 @@ Options passed to `New`:
 
 When `Run`'s context ends (or on `Shutdown(ctx)`), the executor stops accepting triggers, deregisters, waits for
 running jobs for `ShutdownTimeout` (or until `ctx` expires), cancels whatever is left, and delivers the remaining
-results. Every step is bounded: with one admin address, shutdown takes at most `ShutdownTimeout + 2×RequestTimeout +
-2×CancelWait + 1s`, 28s with the defaults, within Kubernetes' default `terminationGracePeriodSeconds` of 30s. If you
+results. Every step is bounded: with one admin address, shutdown takes at most `ShutdownTimeout + RequestTimeout +
+2×CancelWait + 1s` (when `RequestTimeout ≤ CancelWait` and `ShutdownTimeout ≥ 2×RequestTimeout`), 25s with the defaults, within Kubernetes' default `terminationGracePeriodSeconds` of 30s. If you
 raise `ShutdownTimeout` for longer jobs, raise the grace period with it.
 
 ### Keeping results across restarts
@@ -272,7 +272,7 @@ Everything the executor holds is bounded:
 | Resource | Bound |
 |---|---|
 | Job goroutines | `MaxActiveTriggers` (one per job with a running or queued trigger), plus one per handler being run |
-| Triggers in memory | `MaxActiveTriggers` in total, `MaxQueueSize` per job; each request body is at most 256 KiB |
+| Triggers in memory | `MaxActiveTriggers` in total, `MaxQueueSize` per job; each request body is at most 64 KiB |
 | Concurrent handler runs | `MaxConcurrency` when set |
 | Execution logs in memory | 16 MiB (`NewMemoryLogStore`), at most 1/8 per run, oldest finished runs evicted first |
 | Execution logs on disk | 16 MiB per run (`FileLogStore`), kept for the retention period; one open file per running run |
@@ -340,7 +340,7 @@ Without OpenTelemetry, `exec.Stats()` is a cheap snapshot for metrics:
 | Store | |
 |---|---|
 | `NewMemoryLogStore(maxBytes)` (default) | 16 MiB total, at most 1/8 per run, oldest finished runs evicted first; lost on restart |
-| `NewFileLogStore(dir, retentionDays)` | `{dir}/{yyyy-MM-dd}/{logId}.log`, at most 16 MiB per run, keeps the last `retentionDays` days |
+| `NewFileLogStore(FileLogStoreConfig{...})` | `{Dir}/{yyyy-MM-dd}/{logId}.log`, at most `MaxRunBytes` (default 16 MiB) per run, keeps the last `RetentionDays` days |
 | your own | implement `LogStore` and pass it with `WithLogStore` |
 
 Lines longer than 8 KiB are truncated. The admin reads a log from a line to its end, like with the official
@@ -405,15 +405,16 @@ batch may be sent again, and the admin ignores the repeat.
 ### Registration and shutdown
 
 `Start` listens before registering, so a port that is already taken fails `Start` instead of registering an executor
-that cannot receive triggers. The registration is renewed every 30s.
+that cannot receive triggers. The registration is renewed every `RegistryInterval` (default 30s).
 
 `Shutdown(ctx)` follows a plan fixed when it begins:
 
 1. reject new triggers (liveness checks fail too, so failover routing moves work to other instances);
-2. stop the heartbeat and deregister (at most `RequestTimeout`);
+2. stop the heartbeat, wait for the one in progress, and deregister (at most `2×RequestTimeout`);
 3. discard queued triggers and triggers waiting for a slot; wait for running jobs until `ctx` expires, then cancel
    them and wait at most `CancelWait` more;
-4. deliver the remaining results (at least `CancelWait`); save the rest to `CallbackDir`, or log them as lost;
+4. deliver the remaining results (at least `CancelWait`, and always one more attempt); save the rest to
+   `CallbackDir` (up to 512 MiB), or log them as lost;
 5. close the executor port last, so the admin can still kill jobs while it waits.
 
 ### Protocol versions
@@ -427,7 +428,7 @@ executor port always answers HTTP 200 with a JSON body whose code tells success 
 - With `AccessToken` set, every request to the executor is authenticated (constant-time, length-independent
   comparison) before anything runs; the 3.5 protocol also checks `XXL-JOB-APPNAME`. **Without it, anyone who can
   reach the port can trigger and kill jobs and read their logs**: the executor logs a warning at startup.
-- Request bodies are capped at 256 KiB; the HTTP server has timeouts; every request to the admin has a timeout and
+- Request bodies and headers are capped at 64 KiB; the HTTP server has timeouts; every request to the admin has a timeout and
   never follows redirects (which would carry the token elsewhere).
 - Job parameters are never included in error messages, and are capped in the execution log.
 - Only BEAN mode is supported. GLUE scripts sent by the admin are rejected, never executed.

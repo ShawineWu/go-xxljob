@@ -12,51 +12,62 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/ShawineWu/go-xxljob/internal/sched"
 )
 
-// runOnce runs h with the runner against a fresh memory store.
-func runOnce(t *testing.T, h Handler) (code int, msg string, err error) {
+// runOnce runs h with the runner against a fresh memory store and returns the code and message the admin would get.
+func runOnce(t *testing.T, ctx context.Context, h Handler) (code int, msg string, err error) {
 	t.Helper()
 	_, app := capture()
-	return runner{store: NewMemoryLogStore(0), app: app}.run(context.Background(), h, Request{Handler: "T", ShardTotal: 1},
+	res, err := runner{store: NewMemoryLogStore(0), app: app}.run(ctx, h, Request{Handler: "T", ShardTotal: 1},
 		LogRef{LogID: 1, LogTime: time.Now()})
+	o := sched.Classify(context.Cause(ctx), res)
+	return codeOf(o.Status), o.Msg, err
 }
 
-func TestClassify(t *testing.T) {
+func TestRunOutcome(t *testing.T) {
 	// Scenario: handlers end in every way, with and without a cancellation cause on their context
 	// Expect: a cancellation cause wins over what the handler returned (a killed or timed-out handler that returns nil
 	//         is not a success); otherwise errors fail and nil succeeds with the SetResult message
-	cancelled := func(cause error) context.Context {
-		ctx, cancel := context.WithCancelCause(context.Background())
-		cancel(cause)
-		return ctx
-	}
+	note := func(ctx context.Context, _ *Request) error { SetResult(ctx, "note"); return nil }
+	fail := func(context.Context, *Request) error { return errors.New("bad") }
 	cases := []struct {
-		name string
-		ctx  context.Context
-		err  error
-		code int
-		msg  string
+		name  string
+		cause error
+		h     HandlerFunc
+		code  int
+		msg   string
 	}{
-		{"success", context.Background(), nil, CodeSuccess, "note"},
-		{"error", context.Background(), errors.New("bad"), CodeFailure, "bad"},
-		{"killed, returned nil", cancelled(ErrKilled), nil, CodeFailure, ErrKilled.Error()},
-		{"timed out, returned nil", cancelled(ErrTimeout), nil, CodeTimeout, ErrTimeout.Error()},
-		{"timed out, returned ctx.Err", cancelled(ErrTimeout), context.Canceled, CodeTimeout, ErrTimeout.Error()},
-		{"covered, returned own error", cancelled(ErrCovered), errors.New("rollback failed"), CodeFailure, ErrCovered.Error() + ": rollback failed"},
-		{"plain cancel is not a cause", cancelled(context.Canceled), nil, CodeSuccess, "note"},
+		{"success", nil, note, CodeSuccess, "note"},
+		{"error", nil, fail, CodeFailure, "bad"},
+		{"killed, returned nil", ErrKilled, note, CodeFailure, ErrKilled.Error()},
+		{"timed out, returned an error", ErrTimeout, fail, CodeTimeout, ErrTimeout.Error()},
+		{"plain cancel is not a cause", context.Canceled, note, CodeSuccess, "note"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			rs := &runState{result: "note"}
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
+			h := HandlerFunc(func(ctx context.Context, req *Request) error {
+				if c.cause != nil {
+					cancel(c.cause) // cancelled while running
+				}
+				return c.h(ctx, req)
+			})
 
-			code, msg := classify(c.ctx, c.err, rs)
+			code, msg, _ := runOnce(t, ctx, h)
 
 			assert.Equal(t, c.code, code)
 			assert.Equal(t, c.msg, msg)
 		})
 	}
 }
+
+// nilErr is an error whose Error method dereferences its receiver: returned as a typed nil, it panics when formatted.
+type nilErr struct{ msg string }
+
+func (e *nilErr) Error() string { return e.msg }
 
 func TestRunIsolatesPanicsAndGoexit(t *testing.T) {
 	// Scenario: a handler panics with a value whose String method panics too; another calls runtime.Goexit (as
@@ -69,10 +80,12 @@ func TestRunIsolatesPanicsAndGoexit(t *testing.T) {
 	}{
 		{"panic", func(context.Context, *Request) error { panic(badStringer{}) }, "panic: %!v(PANIC=String method: String exploded)"},
 		{"goexit", func(context.Context, *Request) error { runtime.Goexit(); return nil }, errGoexit.Error()},
+		{"error whose Error panics", func(context.Context, *Request) error { var e *nilErr; return e },
+			"panic: runtime error: invalid memory address or nil pointer dereference"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			code, msg, err := runOnce(t, c.h)
+			code, msg, err := runOnce(t, t.Context(), c.h)
 
 			require.Error(t, err)
 			assert.Equal(t, CodeFailure, code)
@@ -98,7 +111,7 @@ func TestExecutionLogLines(t *testing.T) {
 		return nil
 	})
 
-	_, _, err := runner{store: store, app: app}.run(context.Background(), h, Request{Handler: "T", Params: "p", ShardTotal: 1}, ref)
+	_, err := runner{store: store, app: app}.run(t.Context(), h, Request{Handler: "T", Params: "p", ShardTotal: 1}, ref)
 	chunk, _ := store.Read(ref, 1)
 	lines := strings.Split(strings.TrimSuffix(chunk.Content, "\n"), "\n")
 
@@ -119,12 +132,12 @@ func TestLongRunningWarning(t *testing.T) {
 	store := NewMemoryLogStore(0)
 	ref := LogRef{LogID: 1, LogTime: time.Now()}
 
-	code, _, _ := runner{store: store, app: app, longRunning: 30 * time.Millisecond}.run(context.Background(),
+	res, _ := runner{store: store, app: app, longRunning: 30 * time.Millisecond}.run(t.Context(),
 		HandlerFunc(func(context.Context, *Request) error { time.Sleep(100 * time.Millisecond); return nil }),
 		Request{Handler: "T", ShardTotal: 1}, ref)
 	chunk, _ := store.Read(ref, 1)
 
-	assert.Equal(t, CodeSuccess, code)
+	assert.False(t, res.Failed)
 	assert.Equal(t, 1, strings.Count(appLog.String(), "xxljob: job is still running"))
 	assert.Equal(t, 1, strings.Count(chunk.Content, `level=WARN msg="job is still running"`))
 }
@@ -150,14 +163,14 @@ func TestFaultyLogStore(t *testing.T) {
 			// Expect: the run itself is unaffected; the failure is reported once to the application log
 			appLog, app := capture()
 
-			code, _, err := runner{store: faultyStore{panics}, app: app}.run(context.Background(), HandlerFunc(func(ctx context.Context, _ *Request) error {
+			res, err := runner{store: faultyStore{panics}, app: app}.run(t.Context(), HandlerFunc(func(ctx context.Context, _ *Request) error {
 				Logger(ctx).Info("one")
 				Logger(ctx).Info("two")
 				return nil
 			}), Request{Handler: "T", ShardTotal: 1}, LogRef{LogID: 1})
 
 			require.NoError(t, err)
-			assert.Equal(t, CodeSuccess, code)
+			assert.False(t, res.Failed)
 			assert.Equal(t, 1, strings.Count(appLog.String(), "execution log write failed"))
 		})
 	}

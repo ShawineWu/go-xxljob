@@ -20,7 +20,10 @@ const (
 	stateClosed
 )
 
-// lifecycle owns the executor's state (new → running → closing → closed) and runs its shutdown, once.
+// errNotStarted rejects requests that arrive before Start.
+var errNotStarted = errors.New("executor is not started")
+
+// lifecycle owns the executor's state (new → running → closing → closed). Every check of the state goes through it.
 type lifecycle struct {
 	mu       sync.Mutex
 	state    state
@@ -35,10 +38,49 @@ func newLifecycle() lifecycle {
 	return lifecycle{stopping: make(chan struct{}), serveErr: make(chan error, 1)}
 }
 
-func (l *lifecycle) current() state {
+// accepting reports whether the executor takes triggers and answers beats: errNotStarted before Start, ErrShutdown
+// once shutdown has begun.
+func (l *lifecycle) accepting() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.state
+	switch l.state {
+	case stateNew:
+		return errNotStarted
+	case stateRunning:
+		return nil
+	}
+	return ErrShutdown
+}
+
+// begin moves new → running, running fn under the lock first so that nothing sees the executor running before it
+// is ready. It fails, leaving the state unchanged, when fn fails or the executor was already started or shut down.
+func (l *lifecycle) begin(fn func() error) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.state != stateNew {
+		return errors.New("xxljob: executor already started or shut down")
+	}
+	if err := fn(); err != nil {
+		return err
+	}
+	l.state = stateRunning
+	return nil
+}
+
+// beginShutdown moves to closing and reports whether the executor had been started.
+func (l *lifecycle) beginShutdown() (started bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	started = l.state == stateRunning
+	l.state = stateClosing
+	close(l.stopping)
+	return started
+}
+
+func (l *lifecycle) finish() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.state = stateClosed
 }
 
 // Start listens on the executor port (unless WithoutServer is set), then starts the registry heartbeat and the
@@ -56,33 +98,32 @@ func (e *Executor) Start() error {
 }
 
 func (e *Executor) start() error {
-	e.life.mu.Lock()
-	defer e.life.mu.Unlock()
-	if e.life.state != stateNew {
-		return errors.New("xxljob: executor already started or shut down")
-	}
-	if !e.opts.withoutServer {
-		ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", ":"+strconv.Itoa(e.cfg.Port))
-		if err != nil {
-			return fmt.Errorf("xxljob: listen executor port %d: %w", e.cfg.Port, err)
-		}
-		e.server = &http.Server{
-			Handler:           e.Handler(),
-			ReadHeaderTimeout: 5 * time.Second,
-			ReadTimeout:       10 * time.Second,
-			WriteTimeout:      30 * time.Second, // a log read of a long run
-			IdleTimeout:       time.Minute,
-		}
-		go func() {
-			if err := e.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				e.life.serveErr <- fmt.Errorf("xxljob: executor port stopped: %w", err)
+	return e.life.begin(func() error {
+		if !e.opts.withoutServer {
+			ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", ":"+strconv.Itoa(e.cfg.Port))
+			if err != nil {
+				return fmt.Errorf("xxljob: listen executor port %d: %w", e.cfg.Port, err)
 			}
-		}()
-	}
-	e.life.state = stateRunning
-	e.callbacks.Start()
-	e.registry.Start()
-	return nil
+			e.server = &http.Server{
+				Handler:           e.Handler(),
+				ReadHeaderTimeout: 5 * time.Second,
+				ReadTimeout:       10 * time.Second,
+				WriteTimeout:      30 * time.Second, // a log read of a long run
+				IdleTimeout:       time.Minute,
+				MaxHeaderBytes:    maxHeaderBytes,
+			}
+			go func() {
+				if err := e.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					err = fmt.Errorf("xxljob: executor port stopped: %w", err)
+					e.log.Error("xxljob: executor port failed: the admin can no longer trigger or kill jobs here", "err", err)
+					e.life.serveErr <- err // Run shuts down on it
+				}
+			}()
+		}
+		e.callbacks.Start()
+		e.registry.Start()
+		return nil
+	})
 }
 
 // Run starts the executor and blocks until ctx is done, Shutdown is called, or the executor port fails. It then
@@ -103,7 +144,6 @@ func (e *Executor) Run(ctx context.Context) error {
 	case <-ctx.Done():
 	case <-e.life.stopping:
 	case cause = <-e.life.serveErr:
-		e.log.Error("xxljob: executor port failed, shutting down", "err", cause)
 	}
 	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), e.cfg.ShutdownTimeout)
 	defer cancel()
@@ -113,16 +153,18 @@ func (e *Executor) Run(ctx context.Context) error {
 // Shutdown stops the executor gracefully, following a time budget fixed when it begins (see shutdownPlan):
 //
 //  1. reject new triggers (beat and idleBeat fail too, so failover routing sends work elsewhere);
-//  2. stop the registry heartbeat and deregister: at most RequestTimeout;
+//  2. stop the registry heartbeat, wait for the one in progress, and deregister: at most 2×RequestTimeout;
 //  3. discard queued triggers and triggers waiting for a concurrency slot; wait for running jobs until ctx is done,
 //     then cancel them with ErrShutdown and wait at most CancelWait more;
-//  4. deliver the remaining results: at least CancelWait, longer if ctx allows, plus the request in progress (it is
-//     not cut short, since the admin may already have processed it); with CallbackDir set, results still undelivered
-//     are saved for the next process, otherwise they are logged as lost;
+//  4. deliver the remaining results until CancelWait from here, or ctx's deadline if later; the request in progress
+//     is not cut short (the admin may already have processed it), and one more is always attempted, each at most
+//     RequestTimeout; with CallbackDir set, results still undelivered are saved for the next process, otherwise they
+//     are logged as lost;
 //  5. close the executor port (last, so the admin can still kill jobs while waiting): at most 1s; close the log store.
 //
-// With one admin address, it returns at most 2×RequestTimeout + 2×CancelWait + 1s after ctx's deadline (each
-// further address can add a RequestTimeout to the requests that fail over). Without a deadline it waits for running
+// With one admin address, it returns at most 3×RequestTimeout + CancelWait + max(CancelWait, RequestTimeout) + 1s
+// after ctx's deadline, and RequestTimeout + 2×CancelWait + 1s when the deadline leaves time for step 2 (each
+// further address can add a RequestTimeout to every request that fails over). Without a deadline it waits for running
 // jobs indefinitely; every other step stays bounded. It returns ctx's error if running jobs had to be cancelled.
 // Repeated and concurrent calls wait for the first one and return its result.
 func (e *Executor) Shutdown(ctx context.Context) error {
@@ -131,12 +173,7 @@ func (e *Executor) Shutdown(ctx context.Context) error {
 }
 
 func (e *Executor) shutdown(plan shutdownPlan) error {
-	e.life.mu.Lock()
-	started := e.life.state == stateRunning
-	e.life.state = stateClosing
-	close(e.life.stopping)
-	e.life.mu.Unlock()
-
+	started := e.life.beginShutdown()
 	if started {
 		ctx, cancel := plan.deregister()
 		e.registry.Close(ctx)
@@ -156,14 +193,22 @@ func (e *Executor) shutdown(plan shutdownPlan) error {
 		_ = e.server.Shutdown(ctx)
 		cancel()
 	}
-	if cerr := e.logs.Close(); cerr != nil {
+	if cerr := closeLogs(e.logs); cerr != nil {
 		e.log.Error("xxljob: close log store", "err", cerr)
 	}
-	e.life.mu.Lock()
-	e.life.state = stateClosed
-	e.life.mu.Unlock()
+	e.life.finish()
 	e.log.Info("xxljob: executor stopped", "app_name", e.cfg.AppName)
 	return err
+}
+
+// closeLogs closes a log store, which may be the application's own, turning a panic into an error.
+func closeLogs(s LogStore) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("log store Close panicked: %v", p)
+		}
+	}()
+	return s.Close()
 }
 
 // shutdownPlan is the time budget of one shutdown, fixed when it begins. Every step takes its deadline from it,
@@ -182,10 +227,11 @@ func newShutdownPlan(ctx context.Context, cfg Config) shutdownPlan {
 	return shutdownPlan{jobs: ctx, cancelWait: cfg.CancelWait, request: cfg.RequestTimeout, flush: cfg.CancelWait}
 }
 
-// deregister bounds the deregistration. It does not depend on the caller's context, which may already be done:
-// telling the admin to stop routing here matters most when time is short.
+// deregister bounds the deregistration: the heartbeat in progress, then the deregistration request. It does not
+// depend on the caller's context, which may already be done: telling the admin to stop routing here matters most
+// when time is short.
 func (p shutdownPlan) deregister() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), p.request)
+	return context.WithTimeout(context.Background(), 2*p.request)
 }
 
 // callbacks bounds the delivery of the last results: at least flush, or until the caller's deadline if that is

@@ -23,7 +23,7 @@ import (
 
 // guard checks, from inside the handlers, that no job runs twice at once and that MaxConcurrency holds.
 type guard struct {
-	max int
+	limit int
 
 	mu       sync.Mutex
 	perJob   map[int64]int
@@ -31,7 +31,7 @@ type guard struct {
 	violated []string
 }
 
-func newGuard(max int) *guard { return &guard{max: max, perJob: map[int64]int{}} }
+func newGuard(limit int) *guard { return &guard{limit: limit, perJob: map[int64]int{}} }
 
 func (g *guard) middleware(next Handler) Handler {
 	return HandlerFunc(func(ctx context.Context, req *Request) error {
@@ -41,7 +41,7 @@ func (g *guard) middleware(next Handler) Handler {
 		if g.perJob[req.JobID] > 1 {
 			g.violated = append(g.violated, "job ran concurrently")
 		}
-		if g.max > 0 && g.global > g.max {
+		if g.limit > 0 && g.global > g.limit {
 			g.violated = append(g.violated, "MaxConcurrency exceeded")
 		}
 		g.mu.Unlock()
@@ -96,6 +96,7 @@ func stressHandlers() map[string]Handler {
 }
 
 func stressSeed(t *testing.T) uint64 {
+	t.Helper()
 	seed := uint64(time.Now().UnixNano())
 	if v, err := strconv.ParseUint(os.Getenv("XXLJOB_STRESS_SEED"), 10, 64); err == nil {
 		seed = v
@@ -274,7 +275,7 @@ func TestShutdownUnderLoad(t *testing.T) {
 		close(done)
 	}()
 	// Set only after observing the closing state: any trigger that then reads closing came after shutdown began.
-	require.Eventually(t, func() bool { return h.e.life.current() >= stateClosing }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return h.e.life.accepting() != nil }, time.Second, time.Millisecond)
 	closing.Store(true)
 	<-done
 	time.Sleep(20 * time.Millisecond) // keep triggering for a while after shutdown completes

@@ -95,7 +95,7 @@ func mysql(t *testing.T, query string) string {
 		"-N", "-s", "xxl_job", "-e", query).CombinedOutput()
 	require.NoError(t, err, "%s: %s", query, out)
 	var lines []string
-	for _, l := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for l := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
 		if !strings.HasPrefix(l, "mysql: [Warning]") {
 			lines = append(lines, l)
 		}
@@ -159,7 +159,7 @@ func waitLog(t *testing.T, jobID int, pred func(jobLog) bool) jobLog {
 	for time.Now().Before(deadline) {
 		out := mysql(t, fmt.Sprintf(`SELECT id, trigger_code, handle_code, REPLACE(IFNULL(handle_msg,''), '\t', ' '),
 			REPLACE(REPLACE(IFNULL(trigger_msg,''), '\t', ' '), '\n', ' ') FROM xxl_job_log WHERE job_id=%d ORDER BY id`, jobID))
-		for _, line := range strings.Split(out, "\n") {
+		for line := range strings.SplitSeq(out, "\n") {
 			f := strings.SplitN(line, "\t", 5)
 			if len(f) < 5 {
 				continue
@@ -507,7 +507,7 @@ func TestExecutorAgainstRealAdmin(t *testing.T) {
 		rows := mysql(t, "SELECT job_id, handle_code, LEFT(IFNULL(handle_msg,''),60) FROM xxl_job_log WHERE job_id IN ("+in+") AND trigger_code=200")
 		triggered := strings.Count(rows, "\n") + 1
 
-		for _, line := range strings.Split(rows, "\n") {
+		for line := range strings.SplitSeq(rows, "\n") {
 			f := append(strings.SplitN(line, "\t", 3), "") // handle_msg is empty on success, and the trailing tab is trimmed
 			require.GreaterOrEqual(t, len(f), 3, line)
 			switch blockOf[f[0]] {

@@ -42,7 +42,8 @@ const (
 // Downward API). It is rarely needed: a standard pod has a single interface, which auto-detection picks.
 const EnvPodIP = "POD_IP"
 
-// Config configures an Executor. Zero values mean the defaults; negative values are rejected.
+// Config configures an Executor. Zero values mean the defaults; negative values are rejected, except for
+// LongRunningThreshold, where a negative value disables the warning.
 type Config struct {
 	// AdminAddresses are the admin URLs, e.g. http://xxl-job-admin:8080/xxl-job-admin. At least one is required.
 	// With several, requests go to the one that answered last and fail over to the others.
@@ -75,8 +76,9 @@ type Config struct {
 	// messages) the oldest are saved to CallbackDir, or dropped and logged when it is not set.
 	MaxPendingCallbacks int
 	// CallbackDir, when set, is where results that cannot be delivered (admin unreachable at shutdown, queue full)
-	// are saved; they are sent when the admin is reachable again, including by the next process using the same
-	// directory. Without it they are lost, and the admin shows those runs as running.
+	// are saved, up to 512 MiB; they are sent when the admin is reachable again, including by the next process using
+	// the same directory. Use one directory per executor process. Without it they are lost, and the admin shows those
+	// runs as running.
 	CallbackDir string
 
 	// MaxQueueSize caps how many triggers of one job may wait (SERIAL_EXECUTION). Default 1000.
@@ -96,7 +98,7 @@ type Config struct {
 	// Default 1h; a negative value disables it.
 	LongRunningThreshold time.Duration
 	// ShutdownTimeout is how long Run lets running jobs finish when its context ends. Default 15s: with the other
-	// defaults the whole shutdown then takes at most 28s, within Kubernetes' default 30s termination grace period.
+	// defaults the whole shutdown then takes at most 25s, within Kubernetes' default 30s termination grace period.
 	// It does not apply to Shutdown, which uses its own context.
 	ShutdownTimeout time.Duration
 	// CancelWait is how long shutdown waits for runs after cancelling them, and the least time it gives the last
@@ -104,8 +106,11 @@ type Config struct {
 	CancelWait time.Duration
 }
 
-// maxMessageBytes caps the memory held by pending callbacks.
-const maxMessageBytes = 64 << 20
+// maxMessageBytes caps the memory held by pending callbacks, and maxSpoolBytes the disk used in CallbackDir.
+const (
+	maxMessageBytes = 64 << 20
+	maxSpoolBytes   = 512 << 20
+)
 
 // normalize validates the configuration and fills in defaults.
 func (c Config) normalize() (Config, error) {

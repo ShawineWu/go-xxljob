@@ -31,10 +31,3 @@ func (l *Limiter) Allow() (ok bool, suppressed int) {
 	l.last, suppressed, l.suppressed = now, l.suppressed, 0
 	return true, suppressed
 }
-
-// Reset lets the next event through, e.g. after a failure has recovered.
-func (l *Limiter) Reset() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.last, l.suppressed = time.Time{}, 0
-}

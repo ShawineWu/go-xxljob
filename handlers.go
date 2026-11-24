@@ -3,6 +3,7 @@ package xxljob
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sync"
 )
@@ -47,10 +48,15 @@ func (s *handlerSet) add(entries map[string]registered) error {
 			return fmt.Errorf("xxljob: duplicate handler %q", name)
 		}
 	}
-	for name, r := range entries {
-		s.byName[name] = r
-	}
+	maps.Copy(s.byName, entries)
 	return nil
+}
+
+func (s *handlerSet) has(name string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.byName[name]
+	return ok
 }
 
 func (s *handlerSet) use(mws []Middleware) error {

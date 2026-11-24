@@ -313,22 +313,158 @@ func TestCallbacksSurviveRestart(t *testing.T) {
 	assert.Empty(t, left)
 }
 
-func TestSpoolSkipsCorruptFiles(t *testing.T) {
-	// Scenario: the callback Dir holds a valid file, a corrupt one and unrelated files
-	// Expect: the valid results load; the corrupt file is renamed to .bad; unrelated files are left alone
+func TestCallbacksLoadSavedResultsOnlyWhenStarted(t *testing.T) {
+	// Scenario: the callback Dir holds saved results; an executor is created but never started
+	// Expect: the files stay where they are, for the next process to send
 	dir := t.TempDir()
-	sp, err := newSpool(dir)
+	sp, err := newSpool(dir, 0)
+	require.NoError(t, err)
+	require.NoError(t, sp.save(results(1, 3)))
+	a := newAdmin(t)
+
+	_ = callbacks(t, a, CallbackConfig{Dir: dir}, quiet)
+
+	saved, _ := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+	assert.Len(t, saved, 1)
+	assert.Zero(t, a.hits.Load())
+}
+
+func TestCallbacksSurviveCrashAfterLoading(t *testing.T) {
+	// Scenario: a process loads saved results while the admin is down, then crashes (no Close); the next process
+	//           starts with the same Dir once the admin is back
+	// Expect: the loaded files were kept (claimed) and the next process delivers their results, then removes them
+	dir := t.TempDir()
+	sp, err := newSpool(dir, 0)
+	require.NoError(t, err)
+	require.NoError(t, sp.save(results(1, 3)))
+	a := newAdmin(t)
+	a.fail.Store(true)
+	crashed := callbacks(t, a, CallbackConfig{Dir: dir}, quiet)
+	crashed.Start()
+	t.Cleanup(func() { crashed.cancel(); <-crashed.done }) // stand-in for the process exiting
+	require.Eventually(t, func() bool { return a.hits.Load() > 0 }, time.Second, time.Millisecond)
+	claimed, _ := filepath.Glob(filepath.Join(dir, "*"+claimedExt))
+
+	a.fail.Store(false)
+	next := callbacks(t, a, CallbackConfig{Dir: dir}, quiet)
+	next.Start()
+	defer next.Close(t.Context())
+	require.Eventually(t, func() bool { return len(a.deliveredIDs()) >= 3 }, 2*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool {
+		left, _ := filepath.Glob(filepath.Join(dir, "*"))
+		return len(left) == 0
+	}, time.Second, 5*time.Millisecond)
+
+	assert.Len(t, claimed, 1)
+	assert.Subset(t, a.deliveredIDs(), []int64{1, 2, 3})
+}
+
+func TestCallbacksLoadSavedResultsAsRoomAllows(t *testing.T) {
+	// Scenario: the Dir holds 5 files of 4 results; the queue holds 10
+	// Expect: only the files that fit are loaded, leaving the others saved (nothing is pushed out of the queue)
+	dir := t.TempDir()
+	sp, err := newSpool(dir, 0)
+	require.NoError(t, err)
+	for i := range int64(5) {
+		require.NoError(t, sp.save(results(i*4+1, i*4+4)))
+	}
+	a := newAdmin(t)
+	a.hang.Store(true)
+	c, err := NewCallbacks(NewClient([]string{a.srv.URL}, v2(t, ""), nil, time.Second), quiet,
+		CallbackConfig{RetryInterval: time.Hour, MaxPending: 10, MaxBytes: 1 << 20, Dir: dir})
+	require.NoError(t, err)
+
+	c.reload()
+
+	saved, _ := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+	assert.Equal(t, 8, c.Pending())
+	assert.Len(t, saved, 3)
+}
+
+func TestCallbacksQueueOfOneKeepsTheNewest(t *testing.T) {
+	// Scenario: MaxPending 1 while the admin is down
+	// Expect: each push keeps the newest result and drops the older one, instead of dropping everything
+	a := newAdmin(t)
+	a.fail.Store(true)
+	c, err := NewCallbacks(NewClient([]string{a.srv.URL}, v2(t, ""), nil, time.Second), quiet,
+		CallbackConfig{RetryInterval: time.Hour, MaxPending: 1, MaxBytes: 1 << 20})
+	require.NoError(t, err)
+
+	c.Push(results(1, 1)[0])
+	c.Push(results(2, 2)[0])
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	assert.Equal(t, results(2, 2), c.pending)
+}
+
+func TestCallbacksCloseTriesOnceEvenWithoutTime(t *testing.T) {
+	// Scenario: Close with a context that is already done, the admin up and results queued
+	// Expect: one more request is still attempted, so the results are delivered rather than dropped
+	a := newAdmin(t)
+	c, err := NewCallbacks(NewClient([]string{a.srv.URL}, v2(t, ""), nil, time.Second), quiet,
+		CallbackConfig{RetryInterval: time.Hour, MaxPending: 100, MaxBytes: 1 << 20})
+	require.NoError(t, err)
+	c.Start()
+	c.mu.Lock() // queue without notifying the sender
+	c.pending = results(1, 5)
+	c.mu.Unlock()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	c.Close(ctx)
+
+	assert.Equal(t, []int64{1, 2, 3, 4, 5}, a.deliveredIDs())
+}
+
+func TestSpoolToleratesBadContent(t *testing.T) {
+	// Scenario: the Dir holds a valid file, one with a corrupt line, an oversized one, a symlink and unrelated files
+	// Expect: valid lines load and corrupt ones are counted; the oversized file is renamed to .bad; the symlink and
+	//         unrelated files are left alone
+	dir := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "secret")
+	require.NoError(t, os.WriteFile(outside, []byte(`{"logId":99}`+"\n"), 0o600))
+	sp, err := newSpool(dir, 1024)
 	require.NoError(t, err)
 	require.NoError(t, sp.save(results(1, 2)))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "callback-1-1-1.jsonl"), []byte("{not json"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "callback-2-1-1.jsonl"), []byte("{not json\n{\"logId\":3}\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "callback-3-1-1.jsonl"), bytes.Repeat([]byte("x"), 2048), 0o600))
+	require.NoError(t, os.Symlink(outside, filepath.Join(dir, "callback-4-1-1.jsonl")))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("keep"), 0o600))
 
-	got, err := sp.load()
+	got, skipped, err := sp.claim(100)
 
 	require.Error(t, err)
-	assert.Equal(t, results(1, 2), got)
-	assert.FileExists(t, filepath.Join(dir, "callback-1-1-1.jsonl.bad"))
+	assert.ElementsMatch(t, []int64{1, 2, 3}, logIDs(got))
+	assert.Equal(t, 1, skipped)
+	assert.FileExists(t, filepath.Join(dir, "callback-3-1-1.jsonl.bad"))
+	assert.FileExists(t, filepath.Join(dir, "callback-4-1-1.jsonl"))
 	assert.FileExists(t, filepath.Join(dir, "notes.txt"))
+}
+
+func TestSpoolIsBounded(t *testing.T) {
+	// Scenario: saving to a spool limited to 200 bytes
+	// Expect: saves fail once the files would exceed the limit, and the claimed files are then kept on release
+	sp, err := newSpool(t.TempDir(), 200)
+	require.NoError(t, err)
+	require.NoError(t, sp.save(results(1, 2)))
+	_, _, err = sp.claim(10)
+	require.NoError(t, err)
+
+	err = sp.save(results(3, 10))
+	require.NoError(t, sp.release())
+
+	require.ErrorContains(t, err, "byte limit")
+	left, _ := filepath.Glob(filepath.Join(sp.dir, "*"+claimedExt))
+	assert.Len(t, left, 1)
+}
+
+func logIDs(rs []wire.Result) []int64 {
+	out := make([]int64, 0, len(rs))
+	for _, r := range rs {
+		out = append(out, r.LogID)
+	}
+	return out
 }
 
 func TestRegistry(t *testing.T) {
@@ -348,12 +484,13 @@ func TestRegistry(t *testing.T) {
 	assert.Equal(t, 1, a.count("/api/registryRemove"))
 }
 
-func TestRegistryCloseInterruptsHeartbeat(t *testing.T) {
-	// Scenario: Close while a heartbeat request hangs (10s request timeout), with a 200ms context
-	// Expect: Close returns promptly instead of waiting for the heartbeat or the deregistration to time out
+func TestRegistryCloseIsBounded(t *testing.T) {
+	// Scenario: Close while a heartbeat request hangs (1s request timeout), with a 200ms context
+	// Expect: Close returns when its context is done instead of waiting for the heartbeat or the deregistration to
+	//         time out
 	a := newAdmin(t)
 	a.hang.Store(true)
-	r := NewRegistry(NewClient([]string{a.srv.URL}, v2(t, ""), nil, 10*time.Second), quiet, "app", "http://x/", time.Hour)
+	r := NewRegistry(NewClient([]string{a.srv.URL}, v2(t, ""), nil, time.Second), quiet, "app", "http://x/", time.Hour)
 	r.Start()
 	require.Eventually(t, func() bool { return a.hits.Load() > 0 }, time.Second, time.Millisecond)
 
@@ -362,5 +499,34 @@ func TestRegistryCloseInterruptsHeartbeat(t *testing.T) {
 	start := time.Now()
 	r.Close(ctx)
 
-	assert.Less(t, time.Since(start), time.Second)
+	assert.Less(t, time.Since(start), 600*time.Millisecond)
+}
+
+func TestRegistryDeregistersAfterTheHeartbeat(t *testing.T) {
+	// Scenario: Close while a heartbeat request is in progress at the admin
+	// Expect: the deregistration is sent only once the heartbeat has finished, so the heartbeat cannot register the
+	//         executor again after it
+	var mu sync.Mutex
+	var order []string
+	inHeartbeat := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/registry" {
+			inHeartbeat <- struct{}{}
+			time.Sleep(100 * time.Millisecond)
+		}
+		mu.Lock()
+		order = append(order, r.URL.Path)
+		mu.Unlock()
+		_, _ = w.Write([]byte(`{"code":200}`))
+	}))
+	defer srv.Close()
+	r := NewRegistry(NewClient([]string{srv.URL}, v2(t, ""), nil, time.Second), quiet, "app", "http://x/", time.Hour)
+	r.Start()
+	<-inHeartbeat
+
+	r.Close(t.Context())
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"/api/registry", "/api/registryRemove"}, order)
 }

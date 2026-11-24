@@ -12,7 +12,7 @@ Thanks for taking the time to contribute! Bug reports, fixes, docs and tests are
 
 ## Development
 
-Requirements: Go 1.24+, [golangci-lint v2](https://golangci-lint.run/), and Docker with compose v2 for the
+Requirements: Go 1.26+, [golangci-lint v2](https://golangci-lint.run/), and Docker with compose v2 for the
 end-to-end tests.
 
 ```bash
@@ -21,7 +21,7 @@ make cover    # coverage summary
 make stress   # repeat the concurrency stress tests
 make fuzz     # run each fuzz target for FUZZTIME (default 30s)
 make bench    # benchmarks
-make e2e      # end-to-end tests against a real admin (XXL_JOB_VERSION=2.4.1|3.4.2|3.5.0)
+make e2e      # end-to-end tests against a real admin (XXL_JOB_VERSION=2.4.1|3.3.1|3.4.2|3.5.0)
 make e2e-all  # all supported admin versions
 ```
 

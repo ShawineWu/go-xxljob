@@ -10,7 +10,8 @@ import (
 )
 
 // Registry keeps the executor registered with the admin: it registers at once, renews every interval, and
-// deregisters on Close.
+// deregisters on Close. A heartbeat in progress is never interrupted: the admin may already be processing it, and
+// one that landed after the deregistration would register the executor again until it expires.
 type Registry struct {
 	client   *Client
 	log      *slog.Logger
@@ -18,16 +19,14 @@ type Registry struct {
 	interval time.Duration
 
 	registered atomic.Bool
-	ctx        context.Context // cancelled by Close: interrupts an in-flight heartbeat
-	cancel     context.CancelFunc
+	stop       chan struct{} // closed by Close: stops the heartbeat between requests
 	done       chan struct{}
 }
 
 // NewRegistry returns the heartbeat for appName at address.
 func NewRegistry(client *Client, log *slog.Logger, appName, address string, interval time.Duration) *Registry {
-	ctx, cancel := context.WithCancel(context.Background())
 	return &Registry{client: client, log: log, param: wire.NewRegistryParam(appName, address), interval: interval,
-		ctx: ctx, cancel: cancel, done: make(chan struct{})}
+		stop: make(chan struct{}), done: make(chan struct{})}
 }
 
 // Start starts the heartbeat.
@@ -36,12 +35,16 @@ func (r *Registry) Start() { go r.loop() }
 // Registered reports whether the last heartbeat succeeded.
 func (r *Registry) Registered() bool { return r.registered.Load() }
 
-// Close stops the heartbeat and deregisters, giving up when ctx is done.
+// Close stops the heartbeat, waits for the one in progress (it ends within its request timeout, one per admin
+// address), then deregisters. It gives up when ctx is done.
 func (r *Registry) Close(ctx context.Context) {
-	r.cancel()
-	<-r.done
+	close(r.stop)
+	select {
+	case <-r.done:
+	case <-ctx.Done():
+	}
 	r.registered.Store(false)
-	if err := r.client.Post(ctx, "registryRemove", r.param); err != nil {
+	if err := r.client.Post(ctx, wire.ActionRegistryRemove, r.param); err != nil {
 		r.log.Error("xxljob: registryRemove failed", "app_name", r.param.RegistryKey, "address", r.param.RegistryValue, "err", err)
 	}
 }
@@ -53,9 +56,11 @@ func (r *Registry) loop() {
 	defer tick.Stop()
 	healthy := true
 	for {
-		err := r.client.Post(r.ctx, "registry", r.param)
-		if r.ctx.Err() != nil {
+		err := r.client.Post(context.Background(), wire.ActionRegistry, r.param)
+		select {
+		case <-r.stop:
 			return
+		default:
 		}
 		switch {
 		case err != nil && healthy:
@@ -66,7 +71,7 @@ func (r *Registry) loop() {
 		healthy = err == nil
 		r.registered.Store(healthy)
 		select {
-		case <-r.ctx.Done():
+		case <-r.stop:
 			return
 		case <-tick.C:
 		}

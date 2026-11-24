@@ -34,15 +34,18 @@ explicit. It fixes the problems found by an audit of v0.1.0.
 - `Executor.Use` and `Register` reject nil middlewares. Middleware chains are built outside the executor's locks.
 - Execution logs are returned from the requested line to the end, as by the official executor (the admin's log view
   of a finished run reads only one page). `FileLogStore` caps each run at 16 MiB; its retention keeps exactly the last
-  `retentionDays` days and also removes directories dated more than a day ahead.
+  `RetentionDays` days and also removes directories dated further ahead than a trigger's log time may be.
+- `NewFileLogStore` takes a `FileLogStoreConfig` (`Dir`, `RetentionDays`, and `MaxRunBytes`, the per-run cap).
+- Request bodies and headers from the admin are capped at 64 KiB (was 256 KiB for bodies).
 - `Request.BindJSON` errors no longer include the job parameters.
 - otelxxljob: `Instrument(exec)` sets everything up and tags it with the AppName; running, queued and pending
   callbacks are up-down counters; requires OpenTelemetry v1.47.
 
 ### Added
 
-- `Config.CallbackDir`: results that cannot be delivered (admin unreachable at shutdown, queue full) are saved and
-  sent later, including by the next process using the same directory.
+- `Config.CallbackDir`: results that cannot be delivered (admin unreachable at shutdown, queue full) are saved (up to
+  512 MiB) and sent later, including by the next process using the same directory. Saved files are kept until their
+  results are delivered, so a crash right after loading them loses nothing.
 - `CodeSuccess`, `CodeFailure`, `CodeTimeout`.
 - `ARCHITECTURE.md`, and the "Resource limits" section of the README.
 - End-to-end tests against admin 3.3.1 without a token.
@@ -57,7 +60,13 @@ explicit. It fixes the problems found by an audit of v0.1.0.
   least `CancelWait`.
 - A result reported from a cancellation could still be in delivery when shutdown closed the callback queue.
 - `Shutdown` with an expired context returned an error and claimed jobs were cancelled even when none were running.
-- `Run` did not return when `Shutdown` was called elsewhere, or when the executor port failed.
+- `Run` did not return when `Shutdown` was called elsewhere, or when the executor port failed; with `Start`, a failed
+  port is now logged.
+- `beat` and `idleBeat` answered success after shutdown had finished, so failover routing could pick a stopped
+  executor.
+- A heartbeat in progress at shutdown could reach the admin after the deregistration and register the executor again.
+- A handler error whose `Error` method panicked (for example a typed nil) left its job busy forever.
+- A `LogStore` whose `Close` panicked crashed `Shutdown`.
 - The default memory log store copied its whole index on every eviction once full (about 1000× slower writes).
 - `FileLogStore` reopened (and leaked) a run's file when something logged after the run ended; writes after a run
   has ended are now dropped. A failing or panicking log store no longer crashes the executor.

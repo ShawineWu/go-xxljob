@@ -8,6 +8,7 @@ package wire
 import (
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -34,6 +35,48 @@ const (
 	tokenHeader   = "XXL-JOB-ACCESS-TOKEN" //nolint:gosec // G101: a header name, not a credential
 	appNameHeader = "XXL-JOB-APPNAME"
 )
+
+// Paths the admin calls on the executor, besides the run path, which depends on the version (Protocol.RunPath).
+const (
+	PathKill     = "/kill"
+	PathBeat     = "/beat"
+	PathIdleBeat = "/idleBeat"
+	PathLog      = "/log"
+)
+
+// Actions the executor calls on the admin (AdminURL).
+const (
+	ActionRegistry       = "registry"
+	ActionRegistryRemove = "registryRemove"
+	ActionCallback       = "callback"
+)
+
+// Messages of the official executor that the admin console shows as they are.
+const (
+	MsgAlreadyKilled = "job thread already killed."
+	MsgBusy          = "job thread is running or has trigger queue."
+)
+
+// HandlerNotFound is the official executor's message for a trigger of an unknown handler.
+func HandlerNotFound(name string) string { return "job handler [" + name + "] not found." }
+
+// AdminURL is the URL of an action on the admin at addr (without a trailing slash).
+func AdminURL(addr, action string) string { return addr + "/api/" + action }
+
+// DecodeAdminReply checks the body of the admin's answer: an error unless its code is CodeSuccess.
+func DecodeAdminReply(data []byte) error {
+	var rt struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := json.Unmarshal(data, &rt); err != nil {
+		return fmt.Errorf("invalid response %.200q: %w", data, err)
+	}
+	if rt.Code != CodeSuccess {
+		return fmt.Errorf("code %d: %s", rt.Code, rt.Msg)
+	}
+	return nil
+}
 
 // Protocol is one generation of the executor protocol: everything that differs between admin versions.
 type Protocol interface {
@@ -119,7 +162,7 @@ func Fail(format string, args ...any) Reply {
 	return Reply{Code: CodeFail, Msg: fmt.Sprintf(format, args...)}
 }
 
-// Result is the outcome of one run, reported to the admin. It is also the format of the callback spool file.
+// Result is the outcome of one run, reported to the admin.
 type Result struct {
 	LogID   int64  `json:"logId"`
 	LogTime int64  `json:"logTime"` // the log time sent by the admin, reported back unchanged

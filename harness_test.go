@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -22,7 +23,8 @@ const testToken = "secret-token"
 // generation). While down is set it answers every request with a failure.
 type fakeAdmin struct {
 	srv      *httptest.Server
-	down     atomic.Bool
+	down     atomic.Bool // answer every request with a failure
+	hang     atomic.Bool // hold every request until the executor gives up on it
 	registry atomic.Int32
 	removed  atomic.Int32
 
@@ -45,6 +47,10 @@ func newFakeAdmin(t testing.TB) *fakeAdmin {
 		a.mu.Lock()
 		a.headers = append(a.headers, r.Header.Clone())
 		a.mu.Unlock()
+		if a.hang.Load() {
+			<-r.Context().Done()
+			return
+		}
 		if a.down.Load() {
 			_, _ = w.Write([]byte(`{"code":500,"msg":"down"}`))
 			return
@@ -191,9 +197,7 @@ func (h *harness) post(t testing.TB, path string, headers http.Header, body any)
 	require.NoError(t, err)
 	req, err := http.NewRequest(http.MethodPost, h.srv.URL+path, bytes.NewReader(data))
 	require.NoError(t, err)
-	for k, v := range headers {
-		req.Header[k] = v
-	}
+	maps.Copy(req.Header, headers)
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()

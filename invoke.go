@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ShawineWu/go-xxljob/internal/sched"
 	"github.com/ShawineWu/go-xxljob/internal/wire"
 )
 
@@ -22,8 +23,8 @@ type Result struct {
 	Log []string
 }
 
-// Invoke runs a handler once in the current goroutine's context, without an admin, exactly as the executor would:
-// Logger, SetResult and RequestFrom work, req.Timeout is enforced, and a panic becomes a failure. Middlewares
+// Invoke runs a handler once with ctx, without an admin, exactly as the executor would, and waits for it to return:
+// Logger, SetResult and RequestFrom work, req.Timeout is enforced, and a panic or runtime.Goexit becomes a failure. Middlewares
 // registered with an Executor are not applied: wrap h yourself if needed. Use it in unit tests, for manual runs and
 // in maintenance commands. A nil req means empty parameters; ShardTotal 0 means 1.
 //
@@ -48,8 +49,12 @@ func Invoke(ctx context.Context, h Handler, req *Request) Result {
 	}
 	store := NewMemoryLogStore(0)
 	ref := LogRef{LogID: r.LogID, LogTime: r.LogTime}
-	code, msg, err := runner{store: store, app: slog.Default()}.run(ctx, h, r, ref)
-	res := Result{Err: err, Code: code, Msg: wire.TruncateMsg(msg)}
+	run, err := runner{store: store, app: slog.Default()}.run(ctx, h, r, ref)
+	o := sched.Classify(context.Cause(ctx), run)
+	if err == nil && o.Status != sched.Succeeded {
+		err = context.Cause(ctx) // cancelled: the handler's nil does not count
+	}
+	res := Result{Err: err, Code: codeOf(o.Status), Msg: wire.TruncateMsg(o.Msg)}
 	if chunk, rerr := store.Read(ref, 1); rerr == nil && chunk.Content != "" {
 		res.Log = strings.Split(strings.TrimSuffix(chunk.Content, "\n"), "\n")
 	}

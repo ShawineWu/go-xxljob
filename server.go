@@ -11,9 +11,12 @@ import (
 	"github.com/ShawineWu/go-xxljob/internal/wire"
 )
 
-// maxRequestBytes caps the body of a request from the admin. Job parameters are at most 512 characters in the
-// admin's database.
-const maxRequestBytes = 256 << 10
+// Limits on requests from the admin, whose largest field (the job parameters) is at most 512 characters in its
+// database.
+const (
+	maxRequestBytes = 64 << 10
+	maxHeaderBytes  = 64 << 10
+)
 
 // Handler returns the HTTP handler of the executor port: the run path (/run, or /trigger for admin 3.5+), /kill,
 // /beat, /idleBeat and /log. The executor serves it on Config.Port; with WithoutServer, mount it on your own server
@@ -31,18 +34,18 @@ func (e *Executor) Handler() http.Handler {
 		}
 		return e.trigger(req)
 	})
-	route("/kill", func(body []byte) wire.Reply {
+	route(wire.PathKill, func(body []byte) wire.Reply {
 		var req wire.JobRequest
 		if err := json.Unmarshal(body, &req); err != nil {
 			return wire.Fail("invalid kill request: %v", err)
 		}
 		if !e.sched.Kill(req.JobID) {
-			return wire.Reply{Code: CodeSuccess, Msg: "job thread already killed."}
+			return wire.Reply{Code: CodeSuccess, Msg: wire.MsgAlreadyKilled}
 		}
 		return wire.OK()
 	})
-	route("/beat", func([]byte) wire.Reply { return e.beat() })
-	route("/idleBeat", func(body []byte) wire.Reply {
+	route(wire.PathBeat, func([]byte) wire.Reply { return e.beat() })
+	route(wire.PathIdleBeat, func(body []byte) wire.Reply {
 		var req wire.JobRequest
 		if err := json.Unmarshal(body, &req); err != nil {
 			return wire.Fail("invalid idleBeat request: %v", err)
@@ -51,11 +54,11 @@ func (e *Executor) Handler() http.Handler {
 			return r
 		}
 		if e.sched.Busy(req.JobID) {
-			return wire.Fail("job thread is running or has trigger queue.")
+			return wire.Fail("%s", wire.MsgBusy)
 		}
 		return wire.OK()
 	})
-	route("/log", func(body []byte) wire.Reply {
+	route(wire.PathLog, func(body []byte) wire.Reply {
 		q, err := e.proto.DecodeLogRequest(body)
 		if err != nil {
 			return wire.Fail("invalid log request: %v", err)
@@ -98,11 +101,8 @@ func (e *Executor) endpoint(fn func(body []byte) wire.Reply) http.Handler {
 // beat is the liveness probe. It fails before Start and during shutdown, so failover routing sends triggers to
 // other instances.
 func (e *Executor) beat() wire.Reply {
-	switch e.life.current() {
-	case stateNew:
-		return wire.Fail("executor is not started")
-	case stateClosing:
-		return wire.Fail("%s", ErrShutdown)
+	if err := e.life.accepting(); err != nil {
+		return wire.Fail("%s", err)
 	}
 	return wire.OK()
 }

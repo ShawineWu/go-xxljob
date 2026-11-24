@@ -11,7 +11,7 @@
 //	})
 //	if err != nil { ... }
 //	exec.MustRegister("Hello", xxljob.HandlerFunc(func(ctx context.Context, req *xxljob.Request) error {
-//		xxljob.Logger(ctx).Info("hello", "params", req.Params)
+//		xxljob.Logger(ctx).InfoContext(ctx, "hello", "params", req.Params)
 //		return nil
 //	}))
 //	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

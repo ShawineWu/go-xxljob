@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -153,10 +154,10 @@ func TestKillBeatAndIdleBeat(t *testing.T) {
 }
 
 func TestTimeoutReportedAtDeadline(t *testing.T) {
-	// Scenario: a job with a 1s timeout whose handler ignores its context for 3s and then returns nil
+	// Scenario: a job with a 1s timeout whose handler ignores its context for 1.5s and then returns nil
 	// Expect: the admin gets 502 at the deadline, not success when the handler finally returns
 	h := newHarness(t, map[string]Handler{"Stubborn": HandlerFunc(func(context.Context, *Request) error {
-		time.Sleep(3 * time.Second)
+		time.Sleep(1500 * time.Millisecond)
 		return nil
 	})})
 
@@ -166,7 +167,7 @@ func TestTimeoutReportedAtDeadline(t *testing.T) {
 
 	assert.Equal(t, CodeTimeout, cb.Code)
 	assert.Equal(t, ErrTimeout.Error(), cb.Msg)
-	assert.Less(t, time.Since(start), 2500*time.Millisecond)
+	assert.Less(t, time.Since(start), 1400*time.Millisecond)
 }
 
 func TestExecutionLog(t *testing.T) {
@@ -190,10 +191,10 @@ func TestExecutionLog(t *testing.T) {
 			}
 
 			first := read(1, 1)
+			require.NotNil(t, first)
 			next := read(1, first.ToLineNum+1)
 			missing := read(404, 1)
 
-			require.NotNil(t, first)
 			lines := strings.Split(strings.TrimSuffix(first.LogContent, "\n"), "\n")
 			require.Len(t, lines, 4)
 			assert.Contains(t, lines[0], `msg="job start" handler=T params=p`)
@@ -225,4 +226,50 @@ func TestSharding(t *testing.T) {
 
 	assert.Equal(t, "2/3", <-got)
 	assert.Equal(t, "0/1", <-got)
+}
+
+func TestBeatFollowsTheLifecycle(t *testing.T) {
+	// Scenario: beat and a trigger before Start, while running, and after Shutdown has finished
+	// Expect: only the running executor answers beat with success and accepts the trigger; after shutdown both fail
+	//         with ErrShutdown, so failover routing never picks a stopped executor
+	admin := newFakeAdmin(t)
+	e, err := New(testConfig(admin.srv.URL), WithoutServer(), WithLogger(quiet))
+	require.NoError(t, err)
+	require.NoError(t, e.Register("T", HandlerFunc(noop)))
+	srv := httptest.NewServer(e.Handler())
+	defer srv.Close()
+	h := &harness{e: e, admin: admin, srv: srv}
+	probe := func() (beat, run reply) {
+		return h.post(t, "/beat", h.authHeaders(), struct{}{}), h.run(t, trigger{JobID: 1, LogID: 1, ExecutorHandler: "T"})
+	}
+
+	beforeBeat, beforeRun := probe()
+	require.NoError(t, e.Start())
+	runningBeat := h.post(t, "/beat", h.authHeaders(), struct{}{})
+	require.NoError(t, e.Shutdown(t.Context()))
+	afterBeat, afterRun := probe()
+
+	assert.Equal(t, reply{Code: CodeFailure, Msg: "executor is not started"}, beforeBeat)
+	assert.Equal(t, reply{Code: CodeFailure, Msg: "executor is not started"}, beforeRun)
+	assert.Equal(t, CodeSuccess, runningBeat.Code)
+	assert.Equal(t, reply{Code: CodeFailure, Msg: ErrShutdown.Error()}, afterBeat)
+	assert.Equal(t, reply{Code: CodeFailure, Msg: ErrShutdown.Error()}, afterRun)
+}
+
+// panickyStore is a log store whose Close panics.
+type panickyStore struct{ LogStore }
+
+func (panickyStore) Close() error { panic("boom") }
+
+func TestShutdownSurvivesAPanickingLogStore(t *testing.T) {
+	// Scenario: the application's log store panics in Close
+	// Expect: Shutdown completes and logs the panic instead of crashing the process
+	logs, logger := capture()
+	admin := newFakeAdmin(t)
+	h := startHarness(t, admin, testConfig(admin.srv.URL), nil, WithLogger(logger),
+		WithLogStore(panickyStore{NewMemoryLogStore(0)}))
+
+	require.NotPanics(t, func() { _ = h.e.Shutdown(t.Context()) })
+
+	assert.Contains(t, logs.String(), "log store Close panicked: boom")
 }

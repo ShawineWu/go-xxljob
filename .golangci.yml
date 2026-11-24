@@ -14,6 +14,7 @@ linters:
     - gocritic
     - gosec
     - misspell
+    - modernize
     - nilerr
     - noctx
     - perfsprint
@@ -22,6 +23,7 @@ linters:
     - unconvert
     - unparam
     - usestdlibvars
+    - usetesting
     - whitespace
   settings:
     gocritic:

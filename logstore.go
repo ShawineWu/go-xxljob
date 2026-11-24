@@ -2,6 +2,7 @@ package xxljob
 
 import (
 	"bufio"
+	"cmp"
 	"container/list"
 	"errors"
 	"fmt"
@@ -205,13 +206,23 @@ func chunkOf(lines []string, fromLine int) LogChunk {
 // DefaultFileLogRunBytes caps the execution log of a single run in FileLogStore.
 const DefaultFileLogRunBytes = 16 << 20
 
-// FileLogStore writes logs to {dir}/{yyyy-MM-dd}/{logId}.log, dated by the trigger's log time in the local time
-// zone, like the official executor. A run's log is capped at DefaultFileLogRunBytes; further lines are dropped and
-// counted in a note at the end. A background goroutine removes date directories older than the retention period
-// every hour.
+// FileLogStoreConfig configures NewFileLogStore.
+type FileLogStoreConfig struct {
+	// Dir is the root directory. Required.
+	Dir string
+	// RetentionDays keeps the logs of the last RetentionDays days, today included. 0 or less keeps them all.
+	RetentionDays int
+	// MaxRunBytes caps the log of one run. Default DefaultFileLogRunBytes.
+	MaxRunBytes int
+}
+
+// FileLogStore writes logs to {Dir}/{yyyy-MM-dd}/{logId}.log, dated by the trigger's log time in the local time
+// zone, like the official executor. A run's log is capped at MaxRunBytes; further lines are dropped and counted in a
+// note at the end. A background goroutine removes date directories older than the retention period every hour.
 type FileLogStore struct {
-	dir       string
-	retention int
+	dir         string
+	retention   int
+	maxRunBytes int
 
 	mu   sync.Mutex
 	open map[int64]*openLog // logs of running jobs
@@ -225,20 +236,21 @@ type openLog struct {
 	mu      sync.Mutex // serializes the writes of one run; runs do not block each other
 	f       *os.File
 	size    int
+	limit   int
 	dropped int
 }
 
-// NewFileLogStore returns a FileLogStore rooted at dir that keeps the logs of the last retentionDays days, today
-// included; a value <= 0 disables cleanup.
-func NewFileLogStore(dir string, retentionDays int) (*FileLogStore, error) {
-	if dir == "" {
+// NewFileLogStore returns a FileLogStore and starts its cleanup. Close it when done.
+func NewFileLogStore(cfg FileLogStoreConfig) (*FileLogStore, error) {
+	if cfg.Dir == "" {
 		return nil, errors.New("xxljob: log dir is required")
 	}
-	if err := os.MkdirAll(dir, 0o750); err != nil {
+	if err := os.MkdirAll(cfg.Dir, 0o750); err != nil {
 		return nil, fmt.Errorf("xxljob: create log dir: %w", err)
 	}
-	s := &FileLogStore{dir: dir, retention: retentionDays, open: map[int64]*openLog{},
-		stop: make(chan struct{}), done: make(chan struct{})}
+	s := &FileLogStore{dir: cfg.Dir, retention: cfg.RetentionDays, open: map[int64]*openLog{},
+		maxRunBytes: cmp.Or(max(cfg.MaxRunBytes, 0), DefaultFileLogRunBytes),
+		stop:        make(chan struct{}), done: make(chan struct{})}
 	go s.cleanLoop()
 	return s, nil
 }
@@ -259,7 +271,7 @@ func (s *FileLogStore) Write(ref LogRef, line string) error {
 		return nil
 	}
 	line = strings.ReplaceAll(line, "\n", " ") + "\n"
-	if l.size+len(line) > DefaultFileLogRunBytes {
+	if l.size+len(line) > l.limit {
 		l.dropped++
 		return nil
 	}
@@ -282,7 +294,12 @@ func (s *FileLogStore) get(ref LogRef) (*openLog, error) {
 	if err != nil {
 		return nil, fmt.Errorf("xxljob: open log file: %w", err)
 	}
-	l := &openLog{f: f}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("xxljob: open log file: %w", err)
+	}
+	l := &openLog{f: f, size: int(info.Size()), limit: s.maxRunBytes} // a reopened log keeps counting against its cap
 	s.open[ref.LogID] = l
 	return l, nil
 }
@@ -307,7 +324,7 @@ func (l *openLog) close() error {
 	}
 	var err error
 	if l.dropped > 0 {
-		_, err = fmt.Fprintf(l.f, "... %d more lines dropped (log size limit %d bytes per run)\n", l.dropped, DefaultFileLogRunBytes)
+		_, err = fmt.Fprintf(l.f, "... %d more lines dropped (log size limit %d bytes per run)\n", l.dropped, l.limit)
 	}
 	err = errors.Join(err, l.f.Close())
 	l.f = nil
@@ -381,7 +398,8 @@ func (s *FileLogStore) cleanLoop() {
 }
 
 // clean removes date directories outside the retention window: older than retention days (today counting as the
-// first), or more than a day in the future. Other directories are left alone.
+// first), or further in the future than the clock skew a trigger may have (maxClockSkew) and a day. Other
+// directories are left alone.
 func (s *FileLogStore) clean(now time.Time) {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
@@ -389,7 +407,7 @@ func (s *FileLogStore) clean(now time.Time) {
 	}
 	y, m, d := now.Date()
 	today := time.Date(y, m, d, 0, 0, 0, 0, time.Local)
-	oldest, newest := today.AddDate(0, 0, 1-s.retention), today.AddDate(0, 0, 1)
+	oldest, newest := today.AddDate(0, 0, 1-s.retention), today.Add(maxClockSkew).AddDate(0, 0, 1)
 	for _, e := range entries {
 		day, err := time.ParseInLocation(time.DateOnly, e.Name(), time.Local)
 		if err != nil || !e.IsDir() || (!day.Before(oldest) && !day.After(newest)) {

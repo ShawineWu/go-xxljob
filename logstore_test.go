@@ -97,7 +97,7 @@ func TestFileLogStore(t *testing.T) {
 	// Scenario: write a log with a multi-line record, read it from a line, end it, read an unknown log
 	// Expect: {dir}/{date}/{logId}.log with newlines flattened; reads return complete lines to the end
 	dir := t.TempDir()
-	s, err := NewFileLogStore(dir, 0)
+	s, err := NewFileLogStore(FileLogStoreConfig{Dir: dir})
 	require.NoError(t, err)
 	defer func() { _ = s.Close() }()
 	now := time.Now()
@@ -119,7 +119,7 @@ func TestFileLogStoreSkipsIncompleteLine(t *testing.T) {
 	// Scenario: the admin reads a log while a line is being written
 	// Expect: only complete lines are returned; the next read from the following line gets the finished line whole
 	dir := t.TempDir()
-	s, err := NewFileLogStore(dir, 0)
+	s, err := NewFileLogStore(FileLogStoreConfig{Dir: dir})
 	require.NoError(t, err)
 	defer func() { _ = s.Close() }()
 	ref := LogRef{LogID: 9, LogTime: time.Now()}
@@ -145,7 +145,7 @@ func TestFileLogStoreRunLimit(t *testing.T) {
 	// Scenario: a run writes more than DefaultFileLogRunBytes
 	// Expect: the file stops growing at the limit and ends with a note of the dropped lines
 	dir := t.TempDir()
-	s, err := NewFileLogStore(dir, 0)
+	s, err := NewFileLogStore(FileLogStoreConfig{Dir: dir})
 	require.NoError(t, err)
 	defer func() { _ = s.Close() }()
 	ref := LogRef{LogID: 1, LogTime: time.Now()}
@@ -165,17 +165,17 @@ func TestFileLogStoreRunLimit(t *testing.T) {
 }
 
 func TestFileLogStoreRetention(t *testing.T) {
-	// Scenario: 3-day retention with date directories from today back to 10 days ago, two far in the future, and a
-	//           directory that is not a date
-	// Expect: exactly 3 days are kept (today and the two before); old and far-future directories are removed; other
-	//         directories are left alone
+	// Scenario: 3-day retention with date directories from today back to 10 days ago, some within the clock skew a
+	//           trigger may have (7 days ahead), some far in the future, and a directory that is not a date
+	// Expect: exactly 3 days are kept (today and the two before) plus the ones a trigger may still write to; old and
+	//         far-future directories are removed; other directories are left alone
 	dir := t.TempDir()
-	s, err := NewFileLogStore(dir, 3)
+	s, err := NewFileLogStore(FileLogStoreConfig{Dir: dir, RetentionDays: 3})
 	require.NoError(t, err)
 	defer func() { _ = s.Close() }()
 	now := time.Now()
 	day := func(offset int) string { return now.AddDate(0, 0, offset).Format(time.DateOnly) }
-	for _, name := range []string{day(0), day(-1), day(-2), day(-3), day(-10), day(1), day(400), "9999-12-31", "not-a-date"} {
+	for _, name := range []string{day(0), day(-1), day(-2), day(-3), day(-10), day(1), day(7), day(9), day(400), "9999-12-31", "not-a-date"} {
 		require.NoError(t, os.MkdirAll(filepath.Join(dir, name), 0o750))
 	}
 
@@ -187,5 +187,28 @@ func TestFileLogStoreRetention(t *testing.T) {
 		kept = append(kept, e.Name())
 	}
 
-	assert.ElementsMatch(t, []string{day(0), day(-1), day(-2), day(1), "not-a-date"}, kept)
+	assert.ElementsMatch(t, []string{day(0), day(-1), day(-2), day(1), day(7), "not-a-date"}, kept)
+}
+
+func TestFileLogStoreReopenKeepsTheCap(t *testing.T) {
+	// Scenario: a run's log is ended at the size cap, then written again (same log id, e.g. a retried trigger)
+	// Expect: the reopened log still counts what the file holds, so it does not grow past the cap
+	s, err := NewFileLogStore(FileLogStoreConfig{Dir: t.TempDir()})
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+	ref := LogRef{LogID: 1, LogTime: time.Now()}
+	line := strings.Repeat("z", 64<<10)
+	for range DefaultFileLogRunBytes / len(line) {
+		require.NoError(t, s.Write(ref, line))
+	}
+	require.NoError(t, s.End(ref))
+
+	for range 10 {
+		require.NoError(t, s.Write(ref, line))
+	}
+	require.NoError(t, s.End(ref))
+	info, err := os.Stat(s.path(ref))
+	require.NoError(t, err)
+
+	assert.LessOrEqual(t, info.Size(), int64(DefaultFileLogRunBytes+200))
 }

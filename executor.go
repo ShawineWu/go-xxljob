@@ -73,7 +73,7 @@ func New(c Config, opts ...Option) (*Executor, error) {
 	client := report.NewClient(cfg.AdminAddresses, proto, o.httpClient, cfg.RequestTimeout)
 	callbacks, err := report.NewCallbacks(client, o.logger, report.CallbackConfig{
 		RetryInterval: cfg.CallbackRetryInterval, MaxPending: cfg.MaxPendingCallbacks, MaxBytes: maxMessageBytes,
-		Dir: cfg.CallbackDir,
+		Dir: cfg.CallbackDir, MaxSpoolBytes: maxSpoolBytes,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("xxljob: %w", err)
@@ -196,38 +196,39 @@ func (e *Executor) Stats() Stats {
 // trigger validates a run request from the admin and hands it to the scheduler.
 func (e *Executor) trigger(in wire.TriggerRequest) wire.Reply {
 	req, err := e.validate(in)
-	if err == nil {
-		var h Handler
-		if h, err = e.handlers.resolve(in.ExecutorHandler); err == nil {
-			err = e.sched.Submit(&sched.Trigger{
-				JobID: in.JobID, LogID: in.LogID, LogTime: in.LogDateTime, Handler: in.ExecutorHandler,
-				Strategy: in.ExecutorBlockStrategy, Timeout: req.Timeout,
-				Run: func(ctx context.Context) sched.Outcome {
-					code, msg, _ := e.runner.run(ctx, h, req, LogRef{LogID: req.LogID, LogTime: req.LogTime})
-					return sched.Outcome{Code: code, Msg: msg}
-				},
-			})
-			if err == nil {
-				return wire.OK()
-			}
-			return wire.Fail("%s", err) // counted by the scheduler
-		}
+	if err != nil {
+		e.rejected.Add(1)
+		return wire.Fail("%s", err)
 	}
-	e.rejected.Add(1)
-	return wire.Fail("%s", err)
+	err = e.sched.Submit(&sched.Trigger{
+		JobID: in.JobID, LogID: in.LogID, LogTime: in.LogDateTime, Handler: in.ExecutorHandler,
+		Strategy: in.ExecutorBlockStrategy, Timeout: req.Timeout,
+		Run: func(ctx context.Context) sched.Result {
+			// The chain is built when the run starts, so a rejected trigger never runs middleware constructors.
+			h, err := e.handlers.resolve(req.Handler)
+			if err != nil {
+				return sched.Result{Failed: true, Msg: err.Error()}
+			}
+			res, _ := e.runner.run(ctx, h, req, LogRef{LogID: req.LogID, LogTime: req.LogTime})
+			return res
+		},
+	})
+	if err != nil {
+		return wire.Fail("%s", err) // counted by the scheduler
+	}
+	return wire.OK()
 }
 
 // validate checks what the scheduler cannot: the executor's state, the glue type and the values sent by the admin.
 func (e *Executor) validate(in wire.TriggerRequest) (Request, error) {
-	switch e.life.current() {
-	case stateNew:
-		return Request{}, errors.New("executor is not started")
-	case stateClosing:
-		return Request{}, ErrShutdown
+	if err := e.life.accepting(); err != nil {
+		return Request{}, err
 	}
 	switch {
 	case in.GlueType != "" && in.GlueType != wire.GlueBean:
 		return Request{}, fmt.Errorf("glue type [%s] is not supported, only BEAN", in.GlueType)
+	case !e.handlers.has(in.ExecutorHandler):
+		return Request{}, errors.New(wire.HandlerNotFound(in.ExecutorHandler))
 	case in.JobID <= 0 || in.LogID <= 0:
 		return Request{}, fmt.Errorf("invalid trigger: jobId %d, logId %d", in.JobID, in.LogID)
 	case in.ExecutorTimeout < 0 || in.ExecutorTimeout > math.MaxInt64/int64(time.Second):
@@ -250,5 +251,5 @@ func (e *Executor) validate(in wire.TriggerRequest) (Request, error) {
 
 // report delivers a trigger's outcome to the admin. It is the scheduler's Reporter.
 func (e *Executor) report(tr *sched.Trigger, o sched.Outcome) {
-	e.callbacks.Push(wire.Result{LogID: tr.LogID, LogTime: tr.LogTime, Code: o.Code, Msg: wire.TruncateMsg(o.Msg)})
+	e.callbacks.Push(wire.Result{LogID: tr.LogID, LogTime: tr.LogTime, Code: codeOf(o.Status), Msg: wire.TruncateMsg(o.Msg)})
 }
