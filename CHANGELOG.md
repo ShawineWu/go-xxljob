@@ -9,6 +9,8 @@ The executor (`github.com/ShawineWu/go-xxljob`) and the OpenTelemetry integratio
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-24
+
 A redesign around invariants with a single owner each (see [ARCHITECTURE.md](ARCHITECTURE.md)): the scheduler,
 the delivery of results, the wire protocol and the lifecycle are separate parts, and every limit and timeout is
 explicit. It fixes the problems found by an audit of v0.1.0.
@@ -121,5 +123,6 @@ First release.
   execution log) and `ObserveStats` (executor gauges and counters).
 - Unit, stress, fuzz and end-to-end tests (admin 2.4.1, 3.4.2, 3.5.0), and benchmarks.
 
-[Unreleased]: https://github.com/ShawineWu/go-xxljob/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ShawineWu/go-xxljob/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ShawineWu/go-xxljob/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ShawineWu/go-xxljob/releases/tag/v0.1.0
