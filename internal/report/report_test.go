@@ -203,6 +203,8 @@ func TestCallbacksBatchAndRetry(t *testing.T) {
 	require.Eventually(t, func() bool { return a.hits.Load() > 0 }, time.Second, time.Millisecond)
 	a.fail.Store(false)
 	require.Eventually(t, func() bool { return len(a.deliveredIDs()) == 250 }, 2*time.Second, 5*time.Millisecond)
+	// The admin records a batch before answering: the last one is still in flight until its answer is read.
+	require.Eventually(t, func() bool { return c.Pending() == 0 }, time.Second, time.Millisecond)
 
 	ids := a.deliveredIDs()
 	for i, id := range ids {
@@ -213,7 +215,6 @@ func TestCallbacksBatchAndRetry(t *testing.T) {
 	for _, n := range a.batches {
 		assert.LessOrEqual(t, n, batchSize)
 	}
-	assert.Zero(t, c.Pending())
 }
 
 func TestCallbacksPendingCountsInflight(t *testing.T) {
@@ -306,11 +307,14 @@ func TestCallbacksSurviveRestart(t *testing.T) {
 	second.Start()
 	defer second.Close(t.Context())
 	require.Eventually(t, func() bool { return len(a.deliveredIDs()) == 4 }, 2*time.Second, 5*time.Millisecond)
-	left, _ := filepath.Glob(filepath.Join(dir, "*"))
+	// The files go once the answer to the last batch has been read, a moment after the admin recorded it.
+	require.Eventually(t, func() bool {
+		left, _ := filepath.Glob(filepath.Join(dir, "*"))
+		return len(left) == 0
+	}, time.Second, 5*time.Millisecond)
 
 	assert.NotEmpty(t, saved)
 	assert.ElementsMatch(t, []int64{1, 2, 3, 4}, a.deliveredIDs())
-	assert.Empty(t, left)
 }
 
 func TestCallbacksLoadSavedResultsOnlyWhenStarted(t *testing.T) {
