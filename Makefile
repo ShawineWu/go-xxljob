@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := check
 
 GO       ?= go
-VERSIONS ?= 2.4.1 3.4.2 3.5.0
+VERSIONS ?= 2.4.1 3.3.1 3.4.2 3.5.0
 # Go modules in this repository: the executor and the OpenTelemetry integration.
 MODULES  := . otelxxljob
 
@@ -29,8 +29,17 @@ FUZZTIME ?= 30s
 FUZZ_TARGETS = FuzzHandler FuzzChunkOf FuzzLogLine
 
 .PHONY: fuzz
+# The Go fuzz coordinator can report the end of -fuzztime itself as "context deadline exceeded" (it reads the
+# worker context before the deadline has propagated to it). Such a run found nothing: no input is saved and the
+# only error is that line. Any other failure, or a saved failing input, fails the target.
 fuzz: ## Run every fuzz target for FUZZTIME (default 30s)
-	@set -e; for f in $(FUZZ_TARGETS); do echo ">> $$f"; $(GO) test -run '^$$' -fuzz "^$$f$$" -fuzztime $(FUZZTIME) .; done
+	@for f in $(FUZZ_TARGETS); do echo ">> $$f"; \
+		out=$$($(GO) test -run '^$$' -fuzz "^$$f$$" -fuzztime $(FUZZTIME) . 2>&1) && { echo "$$out" | tail -1; continue; }; \
+		echo "$$out" | grep -v '^fuzz: elapsed'; \
+		if ! echo "$$out" | grep -q 'Failing input' && \
+			[ "$$(echo "$$out" | grep -E '^    ' | sed 's/^ *//')" = "context deadline exceeded" ]; then \
+			echo "(ignored: the fuzzing deadline itself, reported by the Go toolchain)"; continue; fi; \
+		exit 1; done
 
 .PHONY: lint
 lint: ## Run golangci-lint (v2) on every module
@@ -46,10 +55,10 @@ tidy: ## Run go mod tidy in every module
 
 .PHONY: vuln
 vuln: ## Scan dependencies for known vulnerabilities
-	@set -e; for m in $(MODULES); do (cd $$m && $(GO) run golang.org/x/vuln/cmd/govulncheck@latest ./...); done
+	@set -e; for m in $(MODULES); do (cd $$m && $(GO) run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...); done
 
 .PHONY: e2e
-e2e: ## Run end-to-end tests against a real xxl-job-admin (docker); XXL_JOB_VERSION=2.4.1|3.4.2|3.5.0
+e2e: ## Run end-to-end tests against a real xxl-job-admin (docker); XXL_JOB_VERSION=2.4.1|3.3.1|3.4.2|3.5.0
 	./e2e/run.sh
 
 .PHONY: e2e-all

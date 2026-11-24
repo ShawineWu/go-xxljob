@@ -1,19 +1,11 @@
 name: CI
 
+# Every change runs CI, documentation included: the checks are required for merging, and a workflow skipped by a
+# path filter never reports them.
 on:
   push:
     branches: [main]
-    paths-ignore: # documentation-only changes do not need CI
-      - "**.md"
-      - LICENSE
-      - .github/ISSUE_TEMPLATE/**
-      - .github/pull_request_template.md
   pull_request:
-    paths-ignore:
-      - "**.md"
-      - LICENSE
-      - .github/ISSUE_TEMPLATE/**
-      - .github/pull_request_template.md
 
 permissions:
   contents: read
@@ -47,7 +39,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go: ["1.24", "oldstable", "stable"] # the minimum supported version and the two latest releases
+        go: ["oldstable", "stable"] # the two supported Go releases; go.mod requires the older one
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
@@ -100,7 +92,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["2.4.1", "3.4.2", "3.5.0"]
+        version: ["2.4.1", "3.3.1", "3.4.2", "3.5.0"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6

@@ -11,14 +11,13 @@
 
 XXL-JOB 是广泛使用的分布式任务调度平台：**调度中心**决定任务什么时候执行，**执行器**负责执行。本库是 Go 服务的执行器。
 
-- **支持调度中心 2.3.0 ~ 3.5.x**，两代协议，改一个配置即可切换。
-- **失败就是失败**：任务返回 `error`，调度中心显示失败并触发告警和失败重试；panic 也会被捕获并按失败回报。
-- **同一任务永远不会并发执行**。三种阻塞策略（单机串行 / 丢弃后续调度 / 覆盖之前调度）与官方 Java 执行器一致，终止后也成立。
-- **功能完整**：终止、超时、调度中心可查看的执行日志、分片广播、结果回调失败重试、优雅退出。
-- **默认安全**：每个请求校验 AccessToken，限制请求体大小，所有连接都有超时。
+- **支持调度中心 2.3.0 ~ 3.5.x**，两代协议，改一个配置即可切换。已对调度中心 2.4.1、3.3.1、3.4.2、3.5.0 做端到端测试。
+- **结果可信**：任务失败就回报失败，调度中心的告警和失败重试会正常触发。任务被终止或超时时，在发生的那一刻就回报，即使 handler 忽略取消、之后返回 nil 也不会被当成成功。
+- **同一任务永远不会并发执行**：三种阻塞策略（单机串行 / 丢弃后续调度 / 覆盖之前调度）与官方执行器一致，并且上一次的 handler 返回后，下一次才会开始。
+- **一切有界**：准入、队列、日志、回调都有上限，关停有时间预算，见[资源上限](#资源上限)。
+- **功能完整**：终止、超时、调度中心可查看的执行日志、分片广播、结果回调失败重试（可选跨重启保留）、优雅退出、OpenTelemetry（[`otelxxljob`](#链路追踪与指标opentelemetry)）。
 - **易于测试**：`xxljob.Invoke` 不需要调度中心，按真实执行的方式跑一次任务。
-- **可观测**：`Stats` 提供累计计数和注册状态；可选的 OpenTelemetry 链路追踪与指标（[`otelxxljob`](#链路追踪与指标opentelemetry)）。
-- **零依赖**：只依赖 Go 标准库（OpenTelemetry 集成是独立的模块）。
+- **零运行时依赖**：只依赖 Go 标准库（testify 只用于测试；OpenTelemetry 集成是独立的模块）。
 
 ## 目录
 
@@ -28,6 +27,7 @@ XXL-JOB 是广泛使用的分布式任务调度平台：**调度中心**决定�
 - [调度中心版本](#调度中心版本)
 - [配置](#配置)
 - [部署](#部署)
+- [资源上限](#资源上限)
 - [进阶用法](#进阶用法)
 - [设计](#设计)
 - [测试](#测试)
@@ -39,7 +39,7 @@ XXL-JOB 是广泛使用的分布式任务调度平台：**调度中心**决定�
 go get github.com/ShawineWu/go-xxljob
 ```
 
-需要 Go 1.24 及以上。
+需要 Go 1.26 及以上（Go 官方维护的两个版本）。
 
 ## 快速开始
 
@@ -66,7 +66,7 @@ func main() {
 	}
 
 	exec.MustRegister("Hello", xxljob.HandlerFunc(func(ctx context.Context, req *xxljob.Request) error {
-		xxljob.Logger(ctx).Info("hello", "params", req.Params) // 调度中心「执行日志」里可见
+		xxljob.Logger(ctx).InfoContext(ctx, "hello", "params", req.Params) // 调度中心「执行日志」里可见
 		return nil
 	}))
 
@@ -111,7 +111,7 @@ func (t *SyncItemsTask) Handle(ctx context.Context, req *xxljob.Request) error {
 		if err := ctx.Err(); err != nil {
 			return err // 超时、被终止、执行器退出时 ctx 会被取消
 		}
-		xxljob.Logger(ctx).Info("synced batch", "size", len(batch))
+		xxljob.Logger(ctx).InfoContext(ctx, "synced batch", "size", len(batch))
 	}
 
 	xxljob.SetResult(ctx, "synced 1200 items") // 成功时的执行备注（可选）
@@ -144,12 +144,12 @@ exec.MustRegister("Cleanup", xxljob.HandleJSON(func(ctx context.Context, req *xx
 |---|---|
 | `req.Params`、`req.BindJSON(&v)` | 调度中心配置的任务参数 |
 | `req.ShardIndex`、`req.ShardTotal` | 分片广播：本实例的分片序号（从 0 开始）和分片总数 |
-| `req.JobID`、`req.LogID`、`req.Timeout` 等 | 本次调度的元数据 |
+| `req.JobID`、`req.LogID`、`req.Timeout` 等 | 本次调度的元数据（handler 拿到的是副本） |
 | `xxljob.Logger(ctx)` | `*slog.Logger`，同时写入调度中心的执行日志**和**应用日志 |
 | `xxljob.SetResult(ctx, msg)` | 成功时回报的执行备注 |
-| `ctx` | 超时、终止、覆盖之前调度、执行器退出时被取消，`context.Cause(ctx)` 可以区分原因 |
+| `ctx` | 超时、终止、覆盖之前调度、更换 JobHandler、执行器退出时被取消，`context.Cause(ctx)` 可以区分原因 |
 
-耗时任务必须检查 `ctx`。任务返回之前，同一任务后续的调度只会排队或被丢弃；不检查 `ctx` 的任务无法被终止。
+ctx 被取消时，这次执行会立即回报失败（超时则回报超时），不管 handler 之后返回什么。耗时任务仍然应该检查 `ctx`：handler 返回之前，这个任务一直处于忙碌状态，后续调度会等待（或按阻塞策略被丢弃）。
 
 ### 单元测试
 
@@ -157,7 +157,7 @@ exec.MustRegister("Cleanup", xxljob.HandleJSON(func(ctx context.Context, req *xx
 
 ```go
 func TestSyncItemsTask(t *testing.T) {
-	res := xxljob.Invoke(context.Background(), NewSyncItemsTask(db), &xxljob.Request{Params: `{"batchSize":10}`})
+	res := xxljob.Invoke(t.Context(), NewSyncItemsTask(db), &xxljob.Request{Params: `{"batchSize":10}`})
 
 	require.NoError(t, res.Err)
 	assert.Equal(t, "synced 1200 items", res.Msg)
@@ -176,63 +176,60 @@ XXL-JOB 3.5.0 修改了执行器协议，与旧版本不兼容，所以要按调
 | 2.3.0 ~ 3.4.x | 不用设置（默认 `"2"`） | 调度中心的全局 token（`xxl.job.accessToken`），可以不配 |
 | 3.5.0 及以上 | `"3.5"` | 「执行器管理」里**该执行器**的 token，**必填** |
 
-调度中心升级到 3.5 时只需改这两项，任务代码不用动。另外调度中心从 3.4.1 起去掉了 `/xxl-job-admin` 路径前缀，`AdminAddresses` 也要相应调整。
+调度中心升级到 3.5 时只需改这两项，任务代码不用动。调度中心从 3.4.1 起去掉了 `/xxl-job-admin` 路径前缀，`AdminAddresses` 也要相应调整。如果调度中心调用了执行器不提供的路径（通常是 `AdminVersion` 为 `"2"` 的执行器收到了 `/trigger`），调度日志里会直接提示去检查 `AdminVersion`。
 
 ## 配置
 
-只有 `AdminAddresses` 和 `AppName` 是必填的。
+只有 `AdminAddresses` 和 `AppName` 是必填的。零值表示使用默认值，负数会被拒绝。
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
-| `AdminAddresses` | 必填 | 调度中心地址；配置多个时依次尝试 |
+| `AdminAddresses` | 必填 | 调度中心地址；配置多个时优先用最近一次成功的地址，失败再切换到其他地址 |
 | `AppName` | 必填 | 执行器 AppName |
 | `AdminVersion` | `"2"` | `"2"`：调度中心 2.3.0 ~ 3.4.x；`"3.5"`：3.5.0+ |
-| `AccessToken` | 空 | 见[调度中心版本](#调度中心版本) |
+| `AccessToken` | 空 | 见[调度中心版本](#调度中心版本)。为空表示执行器端口不鉴权 |
 | `IP` | `$POD_IP`，否则自动探测 | 注册给调度中心的 IP |
 | `Port` | `9999` | 执行器端口 |
 | `Address` | `http://{IP}:{Port}/` | 注册给调度中心的完整地址（经过 NAT、挂在子路径时设置） |
 | `DefaultTimeout` | `0`（不限） | 调度中心没设超时的任务的兜底超时 |
-| `MaxConcurrency` | `0`（不限） | 所有任务合计的并发上限，超出的等待空位 |
+| `MaxConcurrency` | `0`（不限） | 所有任务合计的并发执行上限，超出的等待空位 |
 | `MaxQueueSize` | `1000` | 单个任务最多排队多少次调度（单机串行） |
-| `LongRunningThreshold` | `1h` | 单次执行超过这个时长记一条 Warn |
+| `MaxActiveTriggers` | `2000` | 所有任务合计的在途调度上限（执行中、等待空位、排队中），见[资源上限](#资源上限) |
+| `ShutdownTimeout` | `15s` | `Run` 的 ctx 结束后，等执行中的任务多久 |
+| `CancelWait` | `3s` | 关停时取消任务后再等多久，也是最后一批回调至少能用的时间 |
+| `CallbackDir` | 空 | 发不出去的结果写入这个目录，之后再发送，下一个进程也会接着发 |
+| `MaxPendingCallbacks` | `10000` | 待发送结果的上限（同时不超过 64 MiB） |
+| `LongRunningThreshold` | `1h` | 单次执行超过这个时长记一条 Warn；负数表示关闭 |
 | `RegistryInterval` | `30s` | 注册心跳间隔 |
 | `RequestTimeout` | `3s` | 发往调度中心的单个请求的超时 |
 | `CallbackRetryInterval` | `10s` | 结果回调失败后的重试间隔 |
-| `MaxPendingCallbacks` | `10000` | 待发送结果的上限，超出时丢弃最旧的 |
-| `ShutdownTimeout` | `20s` | `Run` 的 ctx 结束后，等执行中的任务多久 |
-| `CancelWait` | `3s` | `Shutdown` 取消任务后再等多久 |
 
 传给 `New` 的选项：
 
 | 选项 | 默认值 | |
 |---|---|---|
 | `WithLogger(*slog.Logger)` | `slog.Default()` | 执行器自身日志，以及任务日志的应用日志部分 |
-| `WithLogStore(LogStore)` | 内存，16 MB | 执行日志的存储 |
-| `WithMiddleware(...)` | 无 | 对所有任务生效的中间件 |
-| `WithHTTPClient(*http.Client)` | `&http.Client{}` | 访问调度中心的 HTTP 客户端 |
-| `WithoutServer()` | 关 | 不监听端口，自行挂载 `exec.Handler()` |
+| `WithLogStore(LogStore)` | 内存，16 MiB | 执行日志的存储 |
+| `WithHTTPClient(*http.Client)` | `&http.Client{}` | 访问调度中心的 HTTP 客户端（会被复制，且不跟随重定向） |
+| `WithoutServer()` | 关 | 不监听端口，在启动前自行挂载 `exec.HTTPHandler()`（必须设置 `Address`） |
 
 ## 部署
 
 ### 优雅退出
 
-`Run` 的 ctx 结束时（或调用 `Shutdown(ctx)` 时），执行器会拒绝新的调度、注销、最多等执行中的任务 `ShutdownTimeout`
-（或直到 `ctx` 超时）、取消剩下的任务，并发出剩余的结果。要保证运行平台给足时间：
+`Run` 的 ctx 结束时（或调用 `Shutdown(ctx)` 时），执行器会拒绝新的调度、注销、最多等执行中的任务 `ShutdownTimeout`（或直到 `ctx` 超时）、取消剩下的任务，并发出剩余的结果。每一步都有上限：只有一个调度中心地址时，关停最多耗时 `ShutdownTimeout + CancelWait + max(CancelWait, RequestTimeout) + RequestTimeout + 1s`（`ShutdownTimeout ≥ 2×RequestTimeout` 时），默认配置下是 25 秒，在 Kubernetes 默认的 30 秒 `terminationGracePeriodSeconds` 之内。如果为了长任务调大了 `ShutdownTimeout`，宽限期也要相应调大。
 
-```
-ShutdownTimeout（默认 20s）+ 约 10s  <  进程被强制结束前的时间
-```
+### 跨重启保留结果
 
-在 Kubernetes 上就是 `terminationGracePeriodSeconds`（默认 30s）。多出的约 10s 留给注销、`CancelWait` 和最后的回调。
+关停时发不出去的结果（调度中心不可用或太慢）默认会丢失，调度中心会把这些执行一直显示为「运行中」。把 `CallbackDir` 设为一个持久目录（能跨 Pod 保留的卷），这些结果就会被保存下来，由下一个进程接着发送。
 
 ### 兜底超时
 
-调度中心里没设超时的任务，如果卡住又不检查 `ctx`，会一直占着这个任务，后续调度只能排队。按最长的任务设置 `DefaultTimeout` 可以兜底。
+调度中心里没设超时的任务可能一直运行下去。按最长的任务设置 `DefaultTimeout`：到点后这次执行会回报超时，并取消它的 ctx。不检查 ctx 的 handler 会一直占着这个任务直到返回，所以长循环要检查 `ctx`。
 
 ### 执行器 IP
 
-没配 `IP` 和 `Address` 时，执行器注册本机第一个已启用、非回环的 IPv4。标准的 Kubernetes Pod 取到的就是 Pod IP。
-主机或 Pod 有多张网卡（如 Multus）时，请设置 `IP`，或通过 Downward API 注入 Pod IP（`POD_IP` 优先于自动探测）：
+没配 `IP` 和 `Address` 时，执行器注册本机第一个已启用、非回环的 IPv4。标准的 Kubernetes Pod 取到的就是 Pod IP。主机或 Pod 有多张网卡（如 Multus）时，请设置 `IP`，或通过 Downward API 注入 Pod IP（`POD_IP` 优先于自动探测）：
 
 ```yaml
 env:
@@ -241,6 +238,21 @@ env:
       fieldRef:
         fieldPath: status.podIP
 ```
+
+## 资源上限
+
+执行器持有的一切都有上限：
+
+| 资源 | 上限 |
+|---|---|
+| 任务 goroutine | `MaxActiveTriggers`（每个有执行中或排队调度的任务一个），另加每个正在执行的 handler 一个 |
+| 内存中的调度 | 合计 `MaxActiveTriggers`，单个任务 `MaxQueueSize`；每个请求体最多 64 KiB |
+| 同时执行的 handler | 设置了 `MaxConcurrency` 时受其限制 |
+| 内存中的执行日志 | 16 MiB（`NewMemoryLogStore`），单次执行最多占 1/8，优先淘汰最早结束的执行 |
+| 磁盘上的执行日志 | 单次执行 16 MiB（`FileLogStore`），按保留期清理；每个执行中的任务打开一个文件 |
+| 读取执行日志 | 同时最多处理 4 个 `/log` 请求，其余排队等待 |
+| 待发送的结果 | `MaxPendingCallbacks` 且不超过 64 MiB；超出部分写入 `CallbackDir`（最多 512 MiB），或丢弃并记日志 |
+| 关停时间 | 见[优雅退出](#优雅退出) |
 
 ## 进阶用法
 
@@ -259,7 +271,7 @@ exec.Use(func(next xxljob.Handler) xxljob.Handler {
 })
 ```
 
-只对某个任务生效的中间件，放在 `Register(name, handler, middlewares...)` 的参数里。调用链深处的代码可以用 `xxljob.RequestFrom(ctx)` 取到当前调度。
+只对某个任务生效的中间件，放在 `Register(name, handler, middlewares...)` 的参数里。中间件链在每次执行开始时组装，所以 `Use` 对之后开始的执行生效，包括已经在排队的调度。调用链深处的代码可以用 `xxljob.RequestFrom(ctx)` 取到当前调度。
 
 ### 链路追踪与指标（OpenTelemetry）
 
@@ -270,43 +282,35 @@ go get github.com/ShawineWu/go-xxljob/otelxxljob
 ```
 
 ```go
-exec, err := xxljob.New(cfg, xxljob.WithMiddleware(otelxxljob.Middleware())) // 放在最外层
-// ...
-if _, err := otelxxljob.ObserveStats(exec); err != nil { ... }
+if _, err := otelxxljob.Instrument(exec); err != nil { ... } // 在 Start 之前
 ```
 
-- **`Middleware`**：每次执行一个 span（`xxljob {handler}`，带任务 ID、日志 ID、阻塞策略和分片），记录错误和 panic，
-  并区分失败、超时、被终止、被覆盖等结果（`xxljob.result`）；执行耗时记入 `xxljob.job.duration` 直方图；
-  trace ID 会写进执行日志，从调度中心的日志页面就能找到对应的链路。
-- **`ObserveStats`**：导出 `xxljob.executor.running`、`.queued`、`.pending_callbacks`、`.registered` 几个 gauge，
-  以及 `xxljob.executor.triggers`（accepted / rejected）和 `xxljob.executor.results`（success / failure / timeout）
-  两个计数器，都带 AppName 标签。
+- **链路**：每次执行一个 span（`xxljob {handler}`，带任务 ID、日志 ID、阻塞策略和分片），记录错误和 panic，并区分失败、超时、被终止、被覆盖等结果（`xxljob.result`）。trace ID 会写进执行日志，从调度中心的日志页面就能找到对应的链路。
+- **指标**：按 handler 和结果统计的 `xxljob.job.duration` 直方图；`xxljob.executor.running`、`.queued`、`.pending_callbacks` 几个 UpDownCounter；`.registered` gauge；`xxljob.executor.triggers`（accepted / rejected）和 `xxljob.executor.results`（success / failure / timeout）计数器。全部带 AppName 标签。
 
-默认使用全局的 OpenTelemetry provider，也可以用 `WithTracerProvider` / `WithMeterProvider` 指定。调度中心不会传递
-trace 上下文，所以每次执行都是一条新链路，任务内部产生的 span 会挂在它下面。想让应用日志也带上 trace ID，请用
-`xxljob.Logger(ctx).InfoContext(ctx, ...)`，并配合能识别 trace 的 `slog` handler。
+默认使用全局的 OpenTelemetry provider，也可以用 `WithTracerProvider` / `WithMeterProvider` 指定。调度中心不会传递 trace 上下文，所以每次执行都是一条新链路，任务内部产生的 span 会挂在它下面。
 
-### 运行状态与健康检查
+### 运行状态与告警
 
-不用 OpenTelemetry 时，`exec.Stats()` 是一个开销很小的快照，可以用于指标和探针：
+不用 OpenTelemetry 时，`exec.Stats()` 是一个开销很小的快照，可以用于指标：
 
 | 字段 | 类型 | |
 |---|---|---|
-| `Running`、`Queued` | gauge | 执行中（含等待并发空位的）和排队中的调度数 |
-| `PendingCallbacks` | gauge | 待发送的结果数；持续上涨说明调度中心连不上 |
-| `Registered` | 状态 | 最近一次注册心跳是否成功，可用于就绪探针 |
-| `Accepted`、`Rejected` | 计数 | 受理的调度数，以及被拒绝的（handler 不存在、丢弃后续调度、队列满等） |
-| `Succeeded`、`Failed`、`TimedOut` | 计数 | 回报的结果；每个受理的调度恰好落在其中一项 |
+| `Running`、`Queued` | gauge | 有执行中调度的任务数（含等待并发空位的）和排队中的调度数 |
+| `PendingCallbacks` | gauge | 还没送达的结果数；持续上涨说明调度中心连不上 |
+| `Registered` | 状态 | 最近一次注册心跳是否成功。用它做告警；不要用作就绪探针，否则调度中心一宕机所有实例都会被摘流量 |
+| `Accepted`、`Rejected` | 计数 | 受理的调度数，以及被拒绝的（handler 不存在、丢弃后续调度、队列满、执行器繁忙等） |
+| `Succeeded`、`Failed`、`TimedOut` | 计数 | 结果；每个受理的调度恰好落在其中一项 |
 
 ### 执行日志存储
 
 | 存储 | |
 |---|---|
-| `NewMemoryLogStore(maxBytes)`（默认） | 共 16 MB，优先淘汰最早结束的执行，单次执行最多占 1/8；重启后丢失 |
-| `NewFileLogStore(dir, retentionDays)` | `{dir}/{yyyy-MM-dd}/{logId}.log`，保留 `retentionDays` 天 |
+| `NewMemoryLogStore(maxBytes)`（默认） | 共 16 MiB，单次执行最多占 1/8，优先淘汰最早结束的执行；重启后丢失 |
+| `NewFileLogStore(FileLogStoreConfig{...})` | `{Dir}/{yyyy-MM-dd}/{logId}.log`，单次执行最多 `MaxRunBytes`（默认 16 MiB），保留最近 `RetentionDays` 天 |
 | 自定义 | 实现 `LogStore` 接口，用 `WithLogStore` 传入 |
 
-单行超过 8 KB 会被截断。调度中心每次最多读取 1 MB（`MaxLogChunkBytes`），大日志会分页读取，不会一次性加载。
+单行超过 8 KiB 会被截断。调度中心读取日志时从指定行一直读到末尾，和官方执行器一致。存储出错或 panic 都不会让任务失败，错误只记一次日志。
 
 ### 挂到已有的 HTTP 服务上
 
@@ -317,25 +321,20 @@ exec, _ := xxljob.New(xxljob.Config{
 	// ...
 	Address: "http://10.0.0.8:8080/xxl-job/", // 调度中心访问本执行器的完整地址
 }, xxljob.WithoutServer())
-mux.Handle("/xxl-job/", http.StripPrefix("/xxl-job", exec.Handler()))
-_ = exec.Start() // 只注册、回调，不监听端口
+mux.Handle("/xxl-job/", http.StripPrefix("/xxl-job", exec.HTTPHandler())) // 在启动前挂载
+go server.ListenAndServe()
+err := exec.Run(ctx) // 注册和回调；调度中心的请求由你的 HTTP 服务处理
 ```
 
 ## 设计
 
+[ARCHITECTURE.md](ARCHITECTURE.md) 说明了整体设计：下面每一条不变量都由唯一的一个模块负责。
+
 ### 执行模型
 
-每个任务（jobId）有一个**执行线程**（一个 goroutine），按顺序执行这个任务的调度，同一时刻最多一次；空闲时退出，下次调度到来时再创建。
+每个任务（jobId）有一个**执行线程**（一个 goroutine），按顺序执行这个任务的调度，同一时刻最多一次。每个受理的调度都是一次有显式阶段的执行（排队、就绪、等待空位、执行中、取消中、已结束），恰好回报一次结果。
 
-```
-调度请求 ─► 校验（token / handler / 重复 logId）─► 阻塞策略 ─► 入队 ─► 执行线程
-                                                                      │
-                 回调队列 ◄── 结果 ◄── panic 捕获 ◄── 中间件 ◄── 任务 ◄─┘
-                    │
-                    └─► 批量回报调度中心（失败重试、多地址）
-```
-
-每次调度有独立的状态，互不影响。ctx 被取消时，用 `context.Cause(ctx)` 判断原因：
+执行的 ctx 被取消时，可以用 `context.Cause(ctx)` 判断原因，结果会立即回报：
 
 | 原因 | 什么时候 | 回报给调度中心 |
 |---|---|---|
@@ -355,64 +354,62 @@ _ = exec.Start() // 只注册、回调，不监听端口
 | 丢弃后续调度（`DISCARD_LATER`） | 拒绝新的调度 |
 | 覆盖之前调度（`COVER_EARLY`） | 取消正在执行的、丢弃排队的，**等被取消的那次真正返回后**再执行新的 |
 
-**终止**会取消正在执行的调度并丢弃排队的。被取消的那次真正返回之前，任务仍算在执行中，所以终止后马上再触发也不会并发执行。
+**终止**会取消正在执行的调度并丢弃排队的。官方执行器在被取消的 handler 可能还在运行时就开始下一次执行；这里要等被取消的 handler 真正返回才开始下一次，同一任务绝不会重叠执行。
 
 ### 结果回调
 
-执行结果先进入回调队列，由后台 goroutine 批量发给调度中心，依次尝试各个地址。失败的按 `CallbackRetryInterval` 重试，队列有上限。
-退出时会发完剩余的结果。重启前没送达的结果会丢失，调度中心大约 10 分钟后会把这些执行标记为「结果丢失」。
+执行结果先进入队列，批量发给最近一次成功的调度中心地址（失败再切换到其他地址），失败的按 `CallbackRetryInterval` 重试。正在进行的请求不会被中途打断，因为调度中心可能已经处理了它。队列有上限；配置了 `CallbackDir` 时，放不下的、或者关停前发不出去的结果会被保存下来，之后再发，下一个进程也会接着发。投递语义是「至少一次」：响应丢失后同一批可能会重发，调度中心会忽略重复的回调。
 
 ### 注册与退出
 
-`Start` 先监听端口再注册：端口被占用时直接返回错误，不会注册一个收不到调度的执行器。之后每 30s 续期一次。
+`Start` 先监听端口再注册：端口被占用时直接返回错误，不会注册一个收不到调度的执行器。之后每 `RegistryInterval`（默认 30s）续期一次。
 
-`Shutdown(ctx)` 的顺序：
+`Shutdown(ctx)` 按开始时确定的时间计划执行：
 
 1. 拒绝新的调度（存活检测也返回失败，故障转移路由会把调度改派给其他实例）；
-2. 停止心跳并注销；
-3. 排队中的调度回报失败；
-4. 等执行中的任务结束直到 `ctx` 超时，然后取消任务，再等 `CancelWait`；
-5. 发送剩余的结果；
-6. 最后关闭执行器端口，等待期间调度中心仍可终止任务。
+2. 停止心跳，等正在进行的心跳结束，再注销（各最多 `RequestTimeout`）；
+3. 丢弃排队中和等待并发空位的调度；等执行中的任务结束直到 `ctx` 超时，然后取消任务，最多再等 `CancelWait`；
+4. 发送剩余的结果（至少 `CancelWait`，另加进行中的请求和最后一次尝试）；剩下的写入 `CallbackDir`（最多 512 MiB），或记为丢失；
+5. 最后关闭执行器端口，等待期间调度中心仍可终止任务。
 
 ### 协议版本
 
-各代调度中心的差异（触发路径、鉴权请求头、字段名、应答格式、回调格式）都封装在内部的 `protocol` 接口里，每个版本一个文件。
-执行器的其余部分只处理与版本无关的类型，支持新一代协议只需新增一个实现。
+各代调度中心的差异（触发路径、鉴权请求头和文案、字段名、应答格式、回调格式）都封装在 `internal/wire` 里，每个版本一个实现。和官方执行器一样，执行器端口总是返回 HTTP 200，由 JSON 里的 code 区分成功和失败。
 
 ### 安全
 
-- 配置了 `AccessToken` 时，执行器端口的每个请求在执行任何操作前都会校验 token（常量时间比较）；3.5 协议还会校验 `XXL-JOB-APPNAME`。
-- 请求体上限 1 MB；HTTP 服务有读写超时；发往调度中心的请求都有超时。
+- 配置了 `AccessToken` 时，执行器端口的每个请求在执行任何操作前都会校验 token（常量时间比较，且不泄露长度）；3.5 协议还会校验 `XXL-JOB-APPNAME`。**不配置时，任何能访问端口的人都能触发、终止任务并读取日志**，执行器启动时会打一条警告。
+- 请求体和请求头上限 64 KiB；HTTP 服务有超时；发往调度中心的请求都有超时，并且不跟随重定向（重定向会把 token 带到别的主机）。
+- 任务参数不会出现在错误信息里，在执行日志中也会截断。
 - 只支持 BEAN 模式，调度中心下发的 GLUE 脚本会被拒绝，不会执行。
+
+报告漏洞请见 [SECURITY.md](SECURITY.md)。
 
 ## 测试
 
 ```bash
-make test       # 单元测试（-race）
+make test       # 单元测试（-race，所有模块）
 make lint       # golangci-lint
 make e2e        # 端到端测试：Docker 起真实的调度中心（默认 2.4.1）
 XXL_JOB_VERSION=3.5.0 make e2e
-make e2e-all    # 依次测 2.4.1、3.4.2、3.5.0
+make e2e-all    # 依次测 2.4.1、3.3.1、3.4.2、3.5.0
 KEEP=1 make e2e # 测完保留容器，可登录调度中心查看（admin / 123456）
-XXLJOB_E2E_VERBOSE=1 make e2e # 输出执行器的全部日志（Warn 和 Error 总会输出）
 make fuzz       # 每个模糊测试跑 30s（FUZZTIME=5m 可跑更久）
+make stress     # 重复跑并发压力测试
 make bench      # 基准测试
 ```
 
-- **单元测试**用模拟的调度中心覆盖协议、阻塞策略、终止、超时、回调、退出和并发。
-- **压力测试**：`TestMultiJobStress` 对 40 个任务并发执行 800 个随机操作（调度、终止、忙碌检测、读日志），混合三种阻塞策略和成功 / 失败 / panic / 超时 / 只能被终止的任务；
-  `TestShutdownUnderLoad` 在调度持续进来时退出。两者都检查不变量：每个被受理的调度恰好回调一次、被拒绝的没有回调、同一任务从不并发、
-  全局并发不超过上限、没有泄漏的 goroutine。场景随机生成，失败时可用日志里的种子复现：`XXLJOB_STRESS_SEED=<种子> go test -run TestMultiJobStress .`
-- **模糊测试**向两种协议的每个接口发送任意请求，并用任意日志测试分页读取和单行截断，检查不会 panic、所有不变量成立。
-- **端到端测试**针对每个支持的版本运行官方 `xuxueli/xxl-job-admin` 镜像，包括调度中心每秒按 Cron 触发、且执行时间与下一次调度重叠的任务。
-  需要 Docker（compose v2）。调度中心的建表 SQL 在测试时下载并校验 SHA-256（XXL-JOB 以 GPL 发布，不放进本仓库）。
+- **调度层测试**大多在虚拟时钟（`testing/synctest`）上运行：超时、终止、覆盖、关停都在精确的时刻检查，不依赖 sleep，也不会偶发失败。
+- **单元测试**用模拟的调度中心覆盖协议、HTTP 接口、回调（故障转移、重试、上限、落盘）、日志存储和生命周期。
+- **压力测试**对许多任务并发执行数百个随机操作，检查不变量：每个被受理的调度恰好回调一次、被拒绝的没有回调、同一任务从不并发、并发上限成立、计数平衡、没有泄漏的 goroutine。失败时可用日志里的种子复现：`XXLJOB_STRESS_SEED=<种子> go test -run TestMultiJobStress .`
+- **模糊测试**向两种协议的每个接口发送任意请求，并用任意日志测试日志相关代码。
+- **端到端测试**针对 2.4.1、3.3.1（不配 token）、3.4.2、3.5.0 运行官方 `xuxueli/xxl-job-admin` 镜像，包括调度中心每秒按 Cron 触发的任务。需要 Docker（compose v2）。调度中心的建表 SQL 在测试时下载并校验 SHA-256（XXL-JOB 以 GPL 发布，不放进本仓库）。
 
-CI 会运行 lint、Go 1.24 及最新两个 Go 版本的单元测试、简短的模糊测试、`govulncheck`、CodeQL，以及三个调度中心版本的端到端测试。
+CI 会运行 lint、Go 官方维护的两个版本的单元测试、模糊测试、`govulncheck`、CodeQL，以及四个调度中心版本的端到端测试。
 
 ## 参与贡献
 
-欢迎提 Issue 和 Pull Request，详见 [CONTRIBUTING.md](CONTRIBUTING.md)。安全问题请按 [SECURITY.md](SECURITY.md) 私下报告。
+欢迎提 Issue 和 Pull Request，详见 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [ARCHITECTURE.md](ARCHITECTURE.md)。安全问题请按 [SECURITY.md](SECURITY.md) 私下报告。
 
 ## 许可证
 

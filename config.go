@@ -1,6 +1,7 @@
 package xxljob
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ShawineWu/go-xxljob/internal/wire"
 )
 
 // Default values.
@@ -21,29 +24,37 @@ const (
 	DefaultCallbackRetryInterval = 10 * time.Second
 	DefaultMaxPendingCallbacks   = 10000
 	DefaultMaxQueueSize          = 1000
+	DefaultMaxActiveTriggers     = 2000
 	DefaultCancelWait            = 3 * time.Second
-	DefaultShutdownTimeout       = 20 * time.Second
+	DefaultShutdownTimeout       = 15 * time.Second
 	DefaultLongRunningThreshold  = time.Hour
 )
 
+// Admin protocol versions (Config.AdminVersion).
+const (
+	// AdminVersion2 is the protocol of XXL-JOB admin 2.3.0 – 3.4.x (the default).
+	AdminVersion2 = wire.Version2
+	// AdminVersion35 is the protocol of XXL-JOB admin 3.5.0 and later.
+	AdminVersion35 = wire.Version35
+)
+
 // EnvPodIP is the environment variable read when Config.IP is empty (the conventional name for the Kubernetes
-// Downward API). It is rarely needed: a standard pod has a single interface, which auto-detection picks. Set it
-// when a pod has several interfaces (e.g. Multus).
+// Downward API). It is rarely needed: a standard pod has a single interface, which auto-detection picks.
 const EnvPodIP = "POD_IP"
 
-// Config configures an Executor. Zero values fall back to the defaults.
+// Config configures an Executor. Zero values mean the defaults; negative values are rejected, except for
+// LongRunningThreshold, where a negative value disables the warning.
 type Config struct {
-	// AdminAddresses are the admin URLs, e.g. http://xxl-job-admin:8080/xxl-job-admin. At least one is required;
-	// with several, they are tried in order (failover).
+	// AdminAddresses are the admin URLs, e.g. http://xxl-job-admin:8080/xxl-job-admin. At least one is required.
+	// With several, requests go to the one that answered last and fail over to the others.
 	AdminAddresses []string
-	// AdminVersion selects the admin protocol: "2" (default, admin 2.3.0 ~ 3.4.x) or "3.5" (admin 3.5.0+). The two
-	// protocols are incompatible, so switch it together with the admin upgrade.
+	// AdminVersion selects the admin protocol: "2" (default, admin 2.3.0 – 3.4.x) or "3.5" (admin 3.5.0+).
 	AdminVersion string
-	// AccessToken must match the admin. For admin 2.3 ~ 3.4 it is the global xxl.job.accessToken and may be empty
-	// (no authentication). For admin 3.5+ it is this executor's token in the admin console and is required. When
-	// set, every request to the executor must carry it.
+	// AccessToken must match the admin. For admin 2.3 – 3.4 it is the global xxl.job.accessToken and may be empty,
+	// in which case nothing on the executor port is authenticated. For admin 3.5+ it is this executor's token in the
+	// admin console and is required.
 	AccessToken string
-	// AppName is the executor's AppName in the admin ("Executor Management"), i.e. the registry key. Required.
+	// AppName is the executor's AppName in the admin ("Executor Management"). Required.
 	AppName string
 
 	// IP is the IP registered with the admin. When empty, the POD_IP environment variable is used, then the first
@@ -61,29 +72,45 @@ type Config struct {
 	RequestTimeout time.Duration
 	// CallbackRetryInterval is the delay before retrying failed callbacks. Default 10s.
 	CallbackRetryInterval time.Duration
-	// MaxPendingCallbacks caps results waiting to be reported (including retries). Default 10000; beyond it the
-	// oldest are dropped and an error is logged.
+	// MaxPendingCallbacks caps results waiting to be reported. Default 10000; beyond it (or beyond 64 MiB of
+	// messages) the oldest are saved to CallbackDir, or dropped and logged when it is not set.
 	MaxPendingCallbacks int
-	// MaxQueueSize caps how many triggers of one job may wait in its queue (SERIAL_EXECUTION). Default 1000; when
-	// full, new triggers are rejected.
-	MaxQueueSize int
-	// CancelWait is how long Shutdown waits for runs to return after cancelling them. Default 3s.
-	CancelWait time.Duration
-	// ShutdownTimeout is how long Run lets running jobs finish when its context ends, before cancelling them.
-	// Default 20s, which fits Kubernetes' default 30s termination grace period with room for deregistration,
-	// CancelWait and the last callbacks. It does not apply when calling Shutdown directly.
-	ShutdownTimeout time.Duration
+	// CallbackDir, when set, is where results that cannot be delivered (admin unreachable at shutdown, queue full)
+	// are saved, up to 512 MiB; they are sent when the admin is reachable again, including by the next process using
+	// the same directory. Use one directory per executor process. Without it they are lost, and the admin shows those
+	// runs as running.
+	CallbackDir string
 
-	// DefaultTimeout applies to runs the admin sends without a timeout (executorTimeout=0). 0 means no limit.
-	// A stuck handler that ignores its context blocks later triggers of the same job; a fallback timeout bounds it.
+	// MaxQueueSize caps how many triggers of one job may wait (SERIAL_EXECUTION). Default 1000.
+	MaxQueueSize int
+	// MaxActiveTriggers caps the triggers accepted but not finished (running, waiting for a slot or queued) across
+	// all jobs. Default 2000. It bounds the executor's job goroutines and the log files open at once; see the
+	// README's "Resource limits".
+	MaxActiveTriggers int
+	// MaxConcurrency caps runs executing at once across all jobs. 0 means no limit. Triggers waiting for a slot
+	// count as running and can be killed; at shutdown they fail with ErrShutdown without running, like queued ones.
+	MaxConcurrency int
+
+	// DefaultTimeout applies to runs the admin sends without a timeout. 0 means no limit. At the timeout the run is
+	// reported as timed out and its context is cancelled; a handler that ignores its context keeps its job busy.
 	DefaultTimeout time.Duration
 	// LongRunningThreshold logs a warning (application log and execution log) once a run exceeds it.
 	// Default 1h; a negative value disables it.
 	LongRunningThreshold time.Duration
-	// MaxConcurrency caps runs executing at once across all jobs. 0 means no limit. Excess triggers wait for a
-	// slot; while waiting they count as running and can be killed.
-	MaxConcurrency int
+	// ShutdownTimeout is how long Run lets running jobs finish when its context ends. Default 15s: with the other
+	// defaults the whole shutdown then takes at most 25s, within Kubernetes' default 30s termination grace period.
+	// It does not apply to Shutdown, which uses its own context.
+	ShutdownTimeout time.Duration
+	// CancelWait is how long shutdown waits for runs after cancelling them, and the least time it gives the last
+	// callbacks. Default 3s.
+	CancelWait time.Duration
 }
+
+// maxMessageBytes caps the memory held by pending callbacks, and maxSpoolBytes the disk used in CallbackDir.
+const (
+	maxMessageBytes = 64 << 20
+	maxSpoolBytes   = 512 << 20
+)
 
 // normalize validates the configuration and fills in defaults.
 func (c Config) normalize() (Config, error) {
@@ -93,7 +120,7 @@ func (c Config) normalize() (Config, error) {
 		if a == "" {
 			continue
 		}
-		if err := checkHTTPURL(a); err != nil {
+		if err := checkURL(a, false); err != nil {
 			return c, fmt.Errorf("xxljob: invalid admin address %q: %w", a, err)
 		}
 		addrs = append(addrs, a)
@@ -105,20 +132,40 @@ func (c Config) normalize() (Config, error) {
 	if c.AppName = strings.TrimSpace(c.AppName); c.AppName == "" {
 		return c, errors.New("xxljob: AppName is required")
 	}
-	if c.AdminVersion = strings.TrimSpace(c.AdminVersion); c.AdminVersion == "" {
-		c.AdminVersion = AdminVersion2
+	c.AccessToken = strings.TrimSpace(c.AccessToken)
+	c.AdminVersion = cmp.Or(strings.TrimSpace(c.AdminVersion), AdminVersion2)
+
+	for _, f := range []struct {
+		name string
+		v    int64
+	}{
+		{"Port", int64(c.Port)}, {"MaxPendingCallbacks", int64(c.MaxPendingCallbacks)},
+		{"MaxQueueSize", int64(c.MaxQueueSize)}, {"MaxActiveTriggers", int64(c.MaxActiveTriggers)},
+		{"MaxConcurrency", int64(c.MaxConcurrency)}, {"RegistryInterval", int64(c.RegistryInterval)},
+		{"RequestTimeout", int64(c.RequestTimeout)}, {"CallbackRetryInterval", int64(c.CallbackRetryInterval)},
+		{"DefaultTimeout", int64(c.DefaultTimeout)}, {"ShutdownTimeout", int64(c.ShutdownTimeout)},
+		{"CancelWait", int64(c.CancelWait)},
+	} {
+		if f.v < 0 {
+			return c, fmt.Errorf("xxljob: %s must not be negative", f.name)
+		}
 	}
-	if c.Port == 0 {
-		c.Port = DefaultPort
-	}
-	if c.Port < 0 || c.Port > 65535 {
+	c.Port = cmp.Or(c.Port, DefaultPort)
+	if c.Port > 65535 {
 		return c, fmt.Errorf("xxljob: invalid port %d", c.Port)
 	}
+	c.RegistryInterval = cmp.Or(c.RegistryInterval, DefaultRegistryInterval)
+	c.RequestTimeout = cmp.Or(c.RequestTimeout, DefaultRequestTimeout)
+	c.CallbackRetryInterval = cmp.Or(c.CallbackRetryInterval, DefaultCallbackRetryInterval)
+	c.MaxPendingCallbacks = cmp.Or(c.MaxPendingCallbacks, DefaultMaxPendingCallbacks)
+	c.MaxQueueSize = cmp.Or(c.MaxQueueSize, DefaultMaxQueueSize)
+	c.MaxActiveTriggers = cmp.Or(c.MaxActiveTriggers, DefaultMaxActiveTriggers)
+	c.ShutdownTimeout = cmp.Or(c.ShutdownTimeout, DefaultShutdownTimeout)
+	c.CancelWait = cmp.Or(c.CancelWait, DefaultCancelWait)
+	c.LongRunningThreshold = cmp.Or(c.LongRunningThreshold, DefaultLongRunningThreshold)
+
 	if c.Address == "" {
-		ip := c.IP
-		if ip == "" {
-			ip = strings.TrimSpace(os.Getenv(EnvPodIP))
-		}
+		ip := cmp.Or(c.IP, strings.TrimSpace(os.Getenv(EnvPodIP)))
 		if ip == "" {
 			var err error
 			if ip, err = localIPv4(); err != nil {
@@ -127,46 +174,28 @@ func (c Config) normalize() (Config, error) {
 		}
 		c.Address = "http://" + net.JoinHostPort(ip, strconv.Itoa(c.Port)) + "/"
 	}
-	if err := checkHTTPURL(c.Address); err != nil {
+	if err := checkURL(c.Address, true); err != nil {
 		return c, fmt.Errorf("xxljob: invalid executor address %q: %w", c.Address, err)
 	}
 	if !strings.HasSuffix(c.Address, "/") {
 		c.Address += "/" // the admin appends the action name to the address
 	}
-	c.RegistryInterval = orDefault(c.RegistryInterval, DefaultRegistryInterval)
-	c.RequestTimeout = orDefault(c.RequestTimeout, DefaultRequestTimeout)
-	c.CallbackRetryInterval = orDefault(c.CallbackRetryInterval, DefaultCallbackRetryInterval)
-	c.CancelWait = orDefault(c.CancelWait, DefaultCancelWait)
-	c.ShutdownTimeout = orDefault(c.ShutdownTimeout, DefaultShutdownTimeout)
-	if c.MaxPendingCallbacks <= 0 {
-		c.MaxPendingCallbacks = DefaultMaxPendingCallbacks
-	}
-	if c.MaxQueueSize <= 0 {
-		c.MaxQueueSize = DefaultMaxQueueSize
-	}
-	if c.LongRunningThreshold == 0 {
-		c.LongRunningThreshold = DefaultLongRunningThreshold
-	}
-	if c.DefaultTimeout < 0 || c.MaxConcurrency < 0 {
-		return c, errors.New("xxljob: DefaultTimeout and MaxConcurrency must not be negative")
-	}
 	return c, nil
 }
 
-func orDefault(d, def time.Duration) time.Duration {
-	if d <= 0 {
-		return def
-	}
-	return d
-}
-
-func checkHTTPURL(raw string) error {
+// checkURL accepts plain http(s) URLs with a host: no credentials, query or fragment, which would end up in logs or
+// break the paths appended to them.
+func checkURL(raw string, allowPath bool) error {
 	u, err := url.Parse(raw)
-	if err != nil {
+	switch {
+	case err != nil:
 		return err
-	}
-	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+	case (u.Scheme != "http" && u.Scheme != "https") || u.Host == "":
 		return errors.New("must be an http(s) URL with a host")
+	case u.User != nil || u.RawQuery != "" || u.Fragment != "":
+		return errors.New("must not contain credentials, a query or a fragment")
+	case !allowPath && strings.Contains(u.Path, "/api/"):
+		return errors.New("must be the admin's base URL, without /api/")
 	}
 	return nil
 }
@@ -178,35 +207,29 @@ type options struct {
 	logger        *slog.Logger
 	logStore      LogStore
 	httpClient    *http.Client
-	middlewares   []Middleware
 	withoutServer bool
 }
 
-// WithLogger sets the logger for the executor itself and for the application-log side of job logs.
+// WithLogger sets the logger for the executor itself and for the application side of job logs.
 // Default slog.Default().
 func WithLogger(l *slog.Logger) Option {
 	return func(o *options) { o.logger = l }
 }
 
-// WithLogStore sets where execution logs are stored. Default NewMemoryLogStore(0) (in memory, 16MB).
-// The store is closed by Shutdown.
+// WithLogStore sets where execution logs are stored. Default NewMemoryLogStore(0) (in memory, 16 MiB). The
+// executor closes the store on shutdown.
 func WithLogStore(s LogStore) Option {
 	return func(o *options) { o.logStore = s }
 }
 
-// WithHTTPClient sets the client used for requests to the admin. Default &http.Client{}. Each request is also
-// bounded by Config.RequestTimeout.
+// WithHTTPClient sets the client used for requests to the admin. It is copied; the copy never follows redirects.
+// Each request is bounded by Config.RequestTimeout.
 func WithHTTPClient(c *http.Client) Option {
 	return func(o *options) { o.httpClient = c }
 }
 
-// WithMiddleware adds middlewares applied to every handler, outermost first.
-func WithMiddleware(mws ...Middleware) Option {
-	return func(o *options) { o.middlewares = append(o.middlewares, mws...) }
-}
-
-// WithoutServer makes Start skip listening on the executor port: mount Executor.Handler on your own HTTP server
-// and set Config.Address to the matching URL.
+// WithoutServer makes the executor skip listening on Config.Port: mount Executor.HTTPHandler on your own HTTP
+// server, before calling Start, and set Config.Address (required) to the URL it is reachable at.
 func WithoutServer() Option {
 	return func(o *options) { o.withoutServer = true }
 }

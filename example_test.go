@@ -14,8 +14,8 @@ import (
 	"github.com/ShawineWu/go-xxljob"
 )
 
-// This example creates an executor, registers a handler that decodes JSON parameters, writes to the execution log and
-// honors cancellation, then runs the executor until the process is asked to stop.
+// This example creates an executor with a handler that decodes its parameters, logs to the execution log and honors
+// cancellation, then runs it until the process is asked to stop.
 func Example() {
 	exec, err := xxljob.New(xxljob.Config{
 		AdminAddresses: []string{"http://xxl-job-admin:8080/xxl-job-admin"},
@@ -26,19 +26,12 @@ func Example() {
 		panic(err)
 	}
 
-	exec.MustRegister("DemoJobHandler", xxljob.HandlerFunc(func(ctx context.Context, req *xxljob.Request) error {
-		var p struct {
-			Limit int `json:"limit"`
-		}
-		if err := req.BindJSON(&p); err != nil {
-			return err // the admin marks the run as failed, raising alarms and retrying on failure
-		}
-		xxljob.Logger(ctx).Info("processing", "limit", p.Limit) // visible in the admin's execution log
-		for i := range p.Limit {
+	exec.MustRegister("Demo", xxljob.HandleJSON(func(ctx context.Context, _ *xxljob.Request, p struct{ Limit int }) error {
+		xxljob.Logger(ctx).InfoContext(ctx, "processing", "limit", p.Limit) // visible in the admin's execution log
+		for range p.Limit {
 			if err := ctx.Err(); err != nil {
 				return err // timed out, killed, or the executor is shutting down
 			}
-			_ = i
 		}
 		xxljob.SetResult(ctx, "done")
 		return nil
@@ -52,42 +45,46 @@ func Example() {
 	}
 }
 
-// This example mounts the executor on a subpath of an existing HTTP server instead of listening on a port of its own.
+// This example mounts the executor on a sub-path of an existing HTTP server instead of a port of its own.
 func ExampleWithoutServer() {
 	exec, err := xxljob.New(xxljob.Config{
 		AdminAddresses: []string{"http://xxl-job-admin:8080/xxl-job-admin"},
+		AccessToken:    "default_token",
 		AppName:        "demo-executor",
-		Address:        "http://10.0.0.8:8080/xxl-job/", // full URL the admin uses to reach the executor
+		Address:        "http://10.0.0.8:8080/xxl-job/", // the URL the admin uses to reach this executor
 	}, xxljob.WithoutServer())
 	if err != nil {
 		panic(err)
 	}
 	mux := http.NewServeMux()
-	mux.Handle("/xxl-job/", http.StripPrefix("/xxl-job", exec.Handler()))
-	if err := exec.Start(); err != nil { // starts only registration and callbacks; mux serves the requests
-		panic(err)
-	}
+	mux.Handle("/xxl-job/", http.StripPrefix("/xxl-job", exec.HTTPHandler())) // mount before starting
+	srv := &http.Server{Addr: ":8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() { _ = srv.ListenAndServe() }()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	_ = exec.Run(ctx) // registration and callbacks; srv serves the admin's requests
+	_ = srv.Shutdown(context.Background())
 }
 
-// This example applies middleware globally (WithMiddleware or Executor.Use) and to a single handler (the variadic
-// arguments of Register).
-func ExampleMiddleware() {
-	timing := func(next xxljob.Handler) xxljob.Handler {
-		return xxljob.HandlerFunc(func(ctx context.Context, req *xxljob.Request) error {
-			start := time.Now()
-			err := next.Handle(ctx, req)
-			slog.Info("job done", "handler", req.Handler, "elapsed", time.Since(start), "err", err)
-			return err
-		})
-	}
+// This example applies middleware to every handler (Use) and to a single one (the arguments of Register).
+func ExampleExecutor_Use() {
 	exec, err := xxljob.New(xxljob.Config{
 		AdminAddresses: []string{"http://xxl-job-admin:8080/xxl-job-admin"},
 		AppName:        "demo-executor",
-	}, xxljob.WithMiddleware(timing))
+	})
 	if err != nil {
 		panic(err)
 	}
-	onlyWeekdays := func(next xxljob.Handler) xxljob.Handler {
+	exec.Use(func(next xxljob.Handler) xxljob.Handler {
+		return xxljob.HandlerFunc(func(ctx context.Context, req *xxljob.Request) error {
+			start := time.Now()
+			err := next.Handle(ctx, req)
+			slog.InfoContext(ctx, "job done", "handler", req.Handler, "elapsed", time.Since(start), "err", err)
+			return err
+		})
+	})
+	weekdaysOnly := func(next xxljob.Handler) xxljob.Handler {
 		return xxljob.HandlerFunc(func(ctx context.Context, req *xxljob.Request) error {
 			if d := time.Now().Weekday(); d == time.Saturday || d == time.Sunday {
 				return errors.New("skipped on weekends")
@@ -95,30 +92,30 @@ func ExampleMiddleware() {
 			return next.Handle(ctx, req)
 		})
 	}
-	exec.MustRegister("WeekdayJob", xxljob.HandlerFunc(func(context.Context, *xxljob.Request) error { return nil }), onlyWeekdays)
+	exec.MustRegister("Report", xxljob.HandlerFunc(func(context.Context, *xxljob.Request) error { return nil }), weekdaysOnly)
 }
 
-// SyncItemsTask illustrates one type per job: dependencies are injected through the constructor, and Name returns the
-// JobHandler configured in the admin.
-type SyncItemsTask struct {
-	batchSize int
-}
+// SyncItemsTask shows one type per job: dependencies come in through the struct, and Name returns the JobHandler
+// configured in the admin.
+type SyncItemsTask struct{ batchSize int }
 
+// Name implements xxljob.Task.
 func (t *SyncItemsTask) Name() string { return "SyncItems" }
 
+// Handle implements xxljob.Handler.
 func (t *SyncItemsTask) Handle(ctx context.Context, req *xxljob.Request) error {
 	p := struct {
 		BatchSize int `json:"batchSize"`
-	}{BatchSize: t.batchSize} // keeps the default when params are empty
+	}{BatchSize: t.batchSize} // kept when the job has no parameters
 	if err := req.BindJSON(&p); err != nil {
 		return err
 	}
-	xxljob.Logger(ctx).Info("syncing", "batch_size", p.BatchSize, "shard", req.ShardIndex)
+	xxljob.Logger(ctx).InfoContext(ctx, "syncing", "batch_size", p.BatchSize, "shard", req.ShardIndex)
 	return nil
 }
 
-// This example organizes jobs as Task types and registers them in bulk, which suits services with many jobs.
-func ExampleTask() {
+// This example registers jobs as Task types, in bulk.
+func ExampleExecutor_RegisterTasks() {
 	exec, err := xxljob.New(xxljob.Config{
 		AdminAddresses: []string{"http://xxl-job-admin:8080/xxl-job-admin"},
 		AppName:        "demo-executor",
@@ -126,39 +123,12 @@ func ExampleTask() {
 	if err != nil {
 		panic(err)
 	}
-	tasks := []xxljob.Task{
-		&SyncItemsTask{batchSize: 500},
-	}
-	exec.MustRegisterTasks(tasks...)
-}
-
-// This example uses HandleJSON so that a function handler receives its parameters already decoded.
-func ExampleHandleJSON() {
-	exec, err := xxljob.New(xxljob.Config{
-		AdminAddresses: []string{"http://xxl-job-admin:8080/xxl-job-admin"},
-		AppName:        "demo-executor",
-	})
-	if err != nil {
-		panic(err)
-	}
-	type cleanupParams struct {
-		Days int `json:"days"`
-	}
-	exec.MustRegister("Cleanup", xxljob.HandleJSON(func(ctx context.Context, req *xxljob.Request, p cleanupParams) error {
-		if p.Days <= 0 {
-			return errors.New("days must be positive")
-		}
-		xxljob.SetResult(ctx, "cleaned")
-		return nil
-	}))
+	exec.MustRegisterTasks(&SyncItemsTask{batchSize: 500})
 }
 
 // This example runs a handler once without an admin, as a unit test or a maintenance command would.
 func ExampleInvoke() {
-	type params struct {
-		Name string `json:"name"`
-	}
-	greet := xxljob.HandleJSON(func(ctx context.Context, _ *xxljob.Request, p params) error {
+	greet := xxljob.HandleJSON(func(ctx context.Context, _ *xxljob.Request, p struct{ Name string }) error {
 		if p.Name == "" {
 			return errors.New("name is required")
 		}

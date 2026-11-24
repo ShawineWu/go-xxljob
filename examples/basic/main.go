@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -29,7 +30,8 @@ func main() {
 }
 
 func run(logger *slog.Logger) error {
-	logs, err := xxljob.NewFileLogStore(envOr("XXL_JOB_LOG_DIR", os.TempDir()+"/go-xxljob-logs"), 7)
+	dataDir := envOr("XXL_JOB_DATA_DIR", filepath.Join(os.TempDir(), "go-xxljob"))
+	logs, err := xxljob.NewFileLogStore(xxljob.FileLogStoreConfig{Dir: filepath.Join(dataDir, "logs"), RetentionDays: 7})
 	if err != nil {
 		return err
 	}
@@ -38,16 +40,18 @@ func run(logger *slog.Logger) error {
 		AdminVersion:   envOr("XXL_JOB_ADMIN_VERSION", xxljob.AdminVersion2), // "3.5" for admin 3.5.0+
 		AccessToken:    os.Getenv("XXL_JOB_TOKEN"),
 		AppName:        envOr("XXL_JOB_APPNAME", "go-demo"),
-		DefaultTimeout: 10 * time.Minute, // bounds jobs configured without a timeout
-	}, xxljob.WithLogger(logger), xxljob.WithLogStore(logs), xxljob.WithMiddleware(recordDuration(logger)))
+		DefaultTimeout: 10 * time.Minute,                    // bounds jobs configured without a timeout
+		CallbackDir:    filepath.Join(dataDir, "callbacks"), // results undelivered at shutdown are sent by the next run
+	}, xxljob.WithLogger(logger), xxljob.WithLogStore(logs))
 	if err != nil {
 		return err
 	}
+	exec.Use(recordDuration(logger))
 
 	exec.MustRegister("Hello", xxljob.HandlerFunc(hello))
 	exec.MustRegisterTasks(&SyncItemsTask{batchSize: 500}, ShardTask{})
 
-	// Run until SIGINT/SIGTERM, then give running jobs ShutdownTimeout (20s by default) to finish; after that they
+	// Run until SIGINT/SIGTERM, then give running jobs ShutdownTimeout (15s by default) to finish; after that they
 	// are cancelled with xxljob.ErrShutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -57,7 +61,7 @@ func run(logger *slog.Logger) error {
 // hello is the smallest possible handler: everything logged through xxljob.Logger shows up in the admin's
 // execution log, and SetResult becomes the run's note.
 func hello(ctx context.Context, req *xxljob.Request) error {
-	xxljob.Logger(ctx).Info("hello from Go", "params", req.Params)
+	xxljob.Logger(ctx).InfoContext(ctx, "hello from Go", "params", req.Params)
 	xxljob.SetResult(ctx, "said hello")
 	return nil
 }
@@ -87,7 +91,7 @@ func (t *SyncItemsTask) Handle(ctx context.Context, req *xxljob.Request) error {
 			return fmt.Errorf("stopped at batch %d: %w", batch, context.Cause(ctx))
 		case <-time.After(time.Second):
 		}
-		log.Info("synced batch", "batch", batch, "size", p.BatchSize)
+		log.InfoContext(ctx, "synced batch", "batch", batch, "size", p.BatchSize)
 	}
 	xxljob.SetResult(ctx, fmt.Sprintf("synced %d items", 5*p.BatchSize))
 	return nil
@@ -104,7 +108,7 @@ func (ShardTask) Handle(ctx context.Context, req *xxljob.Request) error {
 	if req.ShardTotal <= 0 {
 		return errors.New("invalid shard total")
 	}
-	xxljob.Logger(ctx).Info("processing ids where id % total == index", "index", req.ShardIndex, "total", req.ShardTotal)
+	xxljob.Logger(ctx).InfoContext(ctx, "processing ids where id % total == index", "index", req.ShardIndex, "total", req.ShardTotal)
 	return nil
 }
 
@@ -114,7 +118,7 @@ func recordDuration(logger *slog.Logger) xxljob.Middleware {
 		return xxljob.HandlerFunc(func(ctx context.Context, req *xxljob.Request) error {
 			start := time.Now()
 			err := next.Handle(ctx, req)
-			logger.Info("job finished", "handler", req.Handler, "log_id", req.LogID, "elapsed", time.Since(start), "err", err)
+			logger.InfoContext(ctx, "job finished", "handler", req.Handler, "log_id", req.LogID, "elapsed", time.Since(start), "err", err)
 			return err
 		})
 	}

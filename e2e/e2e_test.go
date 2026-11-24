@@ -35,9 +35,12 @@ import (
 	"github.com/ShawineWu/go-xxljob"
 )
 
+// token is the AccessToken (set by run.sh): the admin's global xxl.job.accessToken before 3.5, stored on the executor
+// record since 3.5. It is empty for versions tested without one (3.3.1 checks that registration works without it).
+var token = os.Getenv("XXLJOB_E2E_TOKEN")
+
 const (
 	appName = "go-e2e"
-	token   = "e2e-token" // 2.x / 3.4: the global xxl.job.accessToken in docker-compose; 3.5+: stored on the executor record
 	// Default admin account created by the schema SQL (exists only in the local test container).
 	adminUser     = "admin"
 	adminPassword = "123456"
@@ -92,7 +95,7 @@ func mysql(t *testing.T, query string) string {
 		"-N", "-s", "xxl_job", "-e", query).CombinedOutput()
 	require.NoError(t, err, "%s: %s", query, out)
 	var lines []string
-	for _, l := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for l := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
 		if !strings.HasPrefix(l, "mysql: [Warning]") {
 			lines = append(lines, l)
 		}
@@ -156,7 +159,7 @@ func waitLog(t *testing.T, jobID int, pred func(jobLog) bool) jobLog {
 	for time.Now().Before(deadline) {
 		out := mysql(t, fmt.Sprintf(`SELECT id, trigger_code, handle_code, REPLACE(IFNULL(handle_msg,''), '\t', ' '),
 			REPLACE(REPLACE(IFNULL(trigger_msg,''), '\t', ' '), '\n', ' ') FROM xxl_job_log WHERE job_id=%d ORDER BY id`, jobID))
-		for _, line := range strings.Split(out, "\n") {
+		for line := range strings.SplitSeq(out, "\n") {
 			f := strings.SplitN(line, "\t", 5)
 			if len(f) < 5 {
 				continue
@@ -409,7 +412,7 @@ func TestExecutorAgainstRealAdmin(t *testing.T) {
 		l := waitLog(t, job, finished)
 
 		assert.Equal(t, 502, l.HandleCode)
-		assert.Equal(t, "xxljob: job execution timeout: context deadline exceeded", l.HandleMsg)
+		assert.Equal(t, xxljob.ErrTimeout.Error(), l.HandleMsg, "reported when the timeout fires")
 	})
 
 	t.Run("kill, then trigger again without concurrency", func(t *testing.T) {
@@ -460,7 +463,7 @@ func TestExecutorAgainstRealAdmin(t *testing.T) {
 		c.kill(second.ID)
 
 		assert.Equal(t, 500, firstDone.HandleCode)
-		assert.Equal(t, "xxljob: job covered by a newer trigger: context canceled", firstDone.HandleMsg)
+		assert.Equal(t, xxljob.ErrCovered.Error(), firstDone.HandleMsg)
 	})
 
 	t.Run("sharding broadcast params", func(t *testing.T) {
@@ -504,7 +507,7 @@ func TestExecutorAgainstRealAdmin(t *testing.T) {
 		rows := mysql(t, "SELECT job_id, handle_code, LEFT(IFNULL(handle_msg,''),60) FROM xxl_job_log WHERE job_id IN ("+in+") AND trigger_code=200")
 		triggered := strings.Count(rows, "\n") + 1
 
-		for _, line := range strings.Split(rows, "\n") {
+		for line := range strings.SplitSeq(rows, "\n") {
 			f := append(strings.SplitN(line, "\t", 3), "") // handle_msg is empty on success, and the trailing tab is trimmed
 			require.GreaterOrEqual(t, len(f), 3, line)
 			switch blockOf[f[0]] {
@@ -524,12 +527,17 @@ func TestExecutorAgainstRealAdmin(t *testing.T) {
 		t.Logf("%d triggers from 8 cron jobs, all called back", triggered)
 	})
 
-	// Whether AccessToken is required depends on the admin version (optional for 2.x / 3.4, covered by the unit test
-	// TestAuthentication); it is configured here, so verify that it is enforced.
+	// Whether AccessToken is required depends on the admin version (optional before 3.5, covered by the unit test
+	// TestAuthentication); when it is configured here, verify that it is enforced.
 	t.Run("with AccessToken configured, requests without it are rejected", func(t *testing.T) {
+		if token == "" {
+			t.Skip("this admin version is tested without an AccessToken")
+		}
 		res := postExecutor(t, p.runPath, map[string]string{"XXL-JOB-APPNAME": appName}, `{"jobId":1,"logId":999999,"executorHandler":"OK"}`)
 
-		assert.Contains(t, res, "The access token is wrong.")
+		want := map[string]string{xxljob.AdminVersion2: "The access token is wrong.",
+			xxljob.AdminVersion35: "invalid request, accessToken or appname is empty."}[p.protocol]
+		assert.Contains(t, res, want)
 	})
 
 	t.Run("shutdown deregisters the executor", func(t *testing.T) {

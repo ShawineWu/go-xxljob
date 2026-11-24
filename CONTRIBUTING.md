@@ -12,16 +12,16 @@ Thanks for taking the time to contribute! Bug reports, fixes, docs and tests are
 
 ## Development
 
-Requirements: Go 1.24+, [golangci-lint v2](https://golangci-lint.run/), and Docker with compose v2 for the
+Requirements: Go 1.26+, [golangci-lint v2](https://golangci-lint.run/), and Docker with compose v2 for the
 end-to-end tests.
 
 ```bash
-make check    # golangci-lint + unit tests with -race (what CI runs)
+make check    # golangci-lint + unit tests with -race (CI also runs fuzz, govulncheck and e2e)
 make cover    # coverage summary
 make stress   # repeat the concurrency stress tests
 make fuzz     # run each fuzz target for FUZZTIME (default 30s)
 make bench    # benchmarks
-make e2e      # end-to-end tests against a real admin (XXL_JOB_VERSION=2.4.1|3.4.2|3.5.0)
+make e2e      # end-to-end tests against a real admin (XXL_JOB_VERSION=2.4.1|3.3.1|3.4.2|3.5.0)
 make e2e-all  # all supported admin versions
 ```
 
@@ -36,20 +36,28 @@ make e2e-all  # all supported admin versions
 
 ## Repository layout
 
-The repository holds two Go modules: the executor at the root and the OpenTelemetry integration in
-[`otelxxljob/`](otelxxljob). `otelxxljob/go.mod` uses a `replace` directive to build against the executor in this
-repository, so changes to both can land in one pull request. The Makefile targets run on every module.
+Read [ARCHITECTURE.md](ARCHITECTURE.md) first: every invariant of the executor has one owner, and a change should
+keep it there rather than spread it.
+
+The repository holds two Go modules: the executor at the root (with its internal packages) and the OpenTelemetry
+integration in [`otelxxljob/`](otelxxljob). `otelxxljob/go.mod` uses a `replace` directive to build against the
+executor in this repository, so changes to both can land in one pull request. `make test`, `lint`, `fmt`, `tidy` and
+`vuln` run on every module; `cover`, `stress`, `bench`, `fuzz` and the e2e targets cover the executor.
 
 ## Releasing (maintainers)
 
 Both modules are released together with the same version (`vX.Y.Z` for the executor, `otelxxljob/vX.Y.Z` for the
 integration):
 
-1. Move the `Unreleased` entries in `CHANGELOG.md` under the new version, and make sure CI on `main` is green.
-2. Tag the executor and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`. The release workflow runs the tests
-   and creates the GitHub release.
+1. Move the `Unreleased` entries in `CHANGELOG.md` under the new version, and make sure CI on `main` is green, end to
+   end tests included. Tags cannot be moved or deleted once pushed (the Go proxy caches them, and a ruleset protects
+   them), so nothing after this step can stop a broken release.
+2. Tag the executor and push the tag: `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`. The release workflow
+   records the GitHub release.
 3. In `otelxxljob/`, require the new executor version (`go get github.com/ShawineWu/go-xxljob@vX.Y.Z`, keeping the
-   `replace`), commit, then tag and push `otelxxljob/vX.Y.Z`.
+   `replace`) and commit that. Then check that it builds against the released executor rather than the
+   repository's: `go mod edit -dropreplace github.com/ShawineWu/go-xxljob && go test ./... && git checkout go.mod
+   go.sum` (this only undoes the check). Wait for CI, then tag and push `otelxxljob/vX.Y.Z`.
 
 ## Reporting security issues
 
